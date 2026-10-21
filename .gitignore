@@ -168,6 +168,7 @@ build/
 # MISC
 # ======================
 *.lock
+!strategy/uv.lock
 *.pid
 *.seed
 *.pid.lock
