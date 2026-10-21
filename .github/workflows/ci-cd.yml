@@ -13,9 +13,10 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
 env:
-  GO_VERSION: '1.21'
-  NODE_VERSION: '24'
   DOCKER_BUILDKIT: 1
 
 jobs:
@@ -53,7 +54,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: backend/go.mod
           cache: false
 
       - name: Install dependencies
@@ -98,113 +99,48 @@ jobs:
           REDIS_DB: 0
           ENCRYPTION_KEY: test-encryption-key-32-chars-long!
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@ab904c41d6ece82784817410c45d8b8c02684457 # v3.1.6
-        with:
-          file: backend/coverage.out
-          flags: backend
-
-  # ── Frontend Tests ─────────────────────────────────────────────────────────────
+  # ── Frontend: shared CI (lint, typecheck, vitest, build) ──────────────────────
   frontend-test:
-    name: Frontend Tests
-    runs-on: ubuntu-latest
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/ci-node.yml@87dc5e1c7e0416886a6371d5a101bb2ccba38edd # v1.1.1
+    with:
+      working-directory: frontend
+      node-version: "24" # npm 11; npm 10 crashes resolving vitest 4 in this tree
+      require-tests: true
+      build-command: NEXT_TELEMETRY_DISABLED=1 npm run build
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        run: |
-          cd frontend
-          npm ci
-
-      - name: Run linter
-        run: |
-          cd frontend
-          npm run lint
-
-      - name: Type check
-        run: |
-          cd frontend
-          npx tsc --noEmit
-
-      - name: Run tests
-        run: |
-          cd frontend
-          npm test
-
-      - name: Build
-        run: |
-          cd frontend
-          npm run build
-        env:
-          NEXT_TELEMETRY_DISABLED: '1'
-
-  # ── Strategy Tests ─────────────────────────────────────────────────────────────
+  # ── Strategy: shared CI (uv.lock, ruff, offline test suites) ──────────────────
   strategy-test:
-    name: Strategy Safety Tests
-    runs-on: ubuntu-latest
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/ci-python.yml@87dc5e1c7e0416886a6371d5a101bb2ccba38edd # v1.1.1
+    with:
+      working-directory: strategy
+      python-version: "3.11" # Dockerfile: python:3.11-slim
+      # Undefined names and syntax errors everywhere; the full rule set on the futures files.
+      lint-command: >-
+        ruff check . --select E9,F63,F7,F82
+        && ruff check app/futures_bot.py app/futures_backtest.py scripts/futures_preflight.py
+        scripts/futures_backtest.py tests/test_futures_safety.py tests/test_futures_backtest.py
+      format-check: false
+      # Full offline suite: exclude only the live API contract file, never touch the network,
+      # keep every trading path in dry-run / paper mode. Then the stdlib research tests, and a check
+      # that requirements.txt (installed by the Dockerfile) still matches uv.lock.
+      test-command: >-
+        POLY_DRY_RUN=true BINANCE_TH_USE_TESTNET=true FUTURES_ENABLED=false
+        FUTURES_EXECUTION_MODE=paper AWS_EC2_METADATA_DISABLED=true
+        python -m pytest tests -q -o addopts= --ignore=tests/test_command_center_contract.py
+        --disable-socket --allow-unix-socket
+        && (cd research && python tests/futures_backtest_test.py && python tests/walk_forward_test.py
+        && python tests/data_test.py && python tests/lake_signal_test.py)
+        && uv export --frozen --no-dev --no-emit-project --format requirements-txt -q | diff -u requirements.txt -
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: strategy/requirements.txt
-
-      - name: Install dependencies
-        run: python -m pip install -r strategy/requirements.txt
-
-      - name: Run strategy tests (full offline suite)
-        working-directory: strategy
-        # Exclude only the live API contract file; do not silently filter new markers.
-        env:
-          POLY_DRY_RUN: 'true'
-          BINANCE_TH_USE_TESTNET: 'true'
-          FUTURES_ENABLED: 'false'
-          FUTURES_EXECUTION_MODE: paper
-          AWS_EC2_METADATA_DISABLED: 'true'
-        run: >-
-          python -m pytest tests -q -o addopts=
-          --ignore=tests/test_command_center_contract.py
-          --disable-socket --allow-unix-socket
-
-      - name: Run strategy research tests (stdlib, offline)
-        working-directory: strategy/research
-        # The lake round-trip test skips without the data-lake runtime (SOLO_DATA_LAKE_ROOT).
-        run: |
-          python tests/futures_backtest_test.py
-          python tests/walk_forward_test.py
-          python tests/data_test.py
-          python tests/lake_signal_test.py
-
-      - name: Check strategy for undefined names and syntax errors
-        working-directory: strategy
-        run: python -m ruff check . --select E9,F63,F7,F82
-
-      - name: Check strategy formatting and lint
-        run: >-
-          python -m ruff check strategy/app/futures_bot.py
-          strategy/app/futures_backtest.py
-          strategy/scripts/futures_preflight.py
-          strategy/scripts/futures_backtest.py
-          strategy/tests/test_futures_safety.py
-          strategy/tests/test_futures_backtest.py
+  # ── Security: shared scan (gitleaks, Semgrep, OSV-Scanner, Trivy) ─────────────
+  security:
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/security.yml@87dc5e1c7e0416886a6371d5a101bb2ccba38edd # v1.1.1
 
   # ── Build Docker Images ────────────────────────────────────────────────────────
   docker-build:
     name: Build Docker Images
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-test, strategy-test]
+    needs: [backend-test, frontend-test, strategy-test, security]
     if: |
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
       (github.event_name == 'workflow_dispatch' && inputs.deploy_production && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
