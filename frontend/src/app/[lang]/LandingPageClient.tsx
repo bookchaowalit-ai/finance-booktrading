@@ -22,7 +22,7 @@ import LoginModal from '@/components/LoginModal';
 import LanguageSelector from '@/components/LanguageSelector';
 
 // ─── Translations ─────────────────────────────────────────────────────────────
-const t = (lang: string, key: string): string => {
+export const t = (lang: string, key: string): string => {
   const translations: Record<string, Record<string, string>> = {
     en: {
       nav_features: 'Features',
@@ -34,13 +34,13 @@ const t = (lang: string, key: string): string => {
       hero_title: 'Trade Smarter,',
       hero_title2: 'Not Harder',
       hero_desc:
-        'TradeBot Pro uses advanced AI algorithms to automate your crypto trading strategy — 24/7, with precision and speed that no human can match.',
+        'TradeBot Pro runs rule-based grid, DCA and trend bots on technical indicators (moving averages, RSI, ADX). It starts in observe-only paper mode, and a kill switch halts trading when risk limits are hit.',
       hero_cta: 'Get Started Free',
       hero_cta2: 'View Dashboard',
       features_title: 'Why TradeBot Pro?',
       features_subtitle: 'Everything you need to trade like a professional',
-      feat1_title: 'AI-Powered Strategies',
-      feat1_desc: 'Multiple proven strategies including grid trading, DCA, and momentum trading powered by machine learning.',
+      feat1_title: 'Rule-based Strategies',
+      feat1_desc: 'Grid trading, DCA and trend-following bots with clear entry and exit rules you can backtest and paper-trade first.',
       feat2_title: 'Real-time Analytics',
       feat2_desc: 'Live charts, technical indicators, and portfolio tracking updated every second.',
       feat3_title: 'Bank-grade Security',
@@ -71,7 +71,7 @@ const t = (lang: string, key: string): string => {
       contact_email_field: 'Email Address',
       contact_message: 'Message',
       contact_send: 'Send Message',
-      footer_desc: 'Automated trading system powered by AI for cryptocurrency markets.',
+      footer_desc: 'Rule-based, paper-first trading bots for cryptocurrency markets.',
       footer_product: 'Product',
       footer_company: 'Company',
       footer_rights: '© 2026 TradeBot Pro. All rights reserved.',
@@ -86,13 +86,13 @@ const t = (lang: string, key: string): string => {
       hero_title: 'เทรดอย่างชาญฉลาด',
       hero_title2: 'ไม่ใช่แค่พยายาม',
       hero_desc:
-        'TradeBot Pro ใช้ AI ขั้นสูงเพื่อทำให้กลยุทธ์การเทรดคริปโตของคุณเป็นอัตโนมัติ — ตลอด 24/7 ด้วยความแม่นยำและความเร็วที่มนุษย์ทำไม่ได้',
+        'TradeBot Pro รันบอท Grid, DCA และตามเทรนด์แบบตามกฎ โดยใช้ indicator ทางเทคนิค (เส้นค่าเฉลี่ย, RSI, ADX) เริ่มจากโหมดเทรดกระดาษแบบดูอย่างเดียว และมี kill switch หยุดการเทรดเมื่อถึงขีดจำกัดความเสี่ยง',
       hero_cta: 'เริ่มต้นฟรี',
       hero_cta2: 'ดูแดชบอร์ด',
       features_title: 'ทำไมต้อง TradeBot Pro?',
       features_subtitle: 'ทุกสิ่งที่คุณต้องการเพื่อเทรดระดับมืออาชีพ',
-      feat1_title: 'กลยุทธ์ขับเคลื่อนด้วย AI',
-      feat1_desc: 'กลยุทธ์ที่ผ่านการพิสูจน์หลายรูปแบบ ไม่ว่าจะเป็น Grid Trading, DCA และ Momentum จาก Machine Learning',
+      feat1_title: 'กลยุทธ์แบบตามกฎ',
+      feat1_desc: 'บอท Grid Trading, DCA และตามเทรนด์ ที่มีกฎเข้าและออกชัดเจน ทดสอบย้อนหลังและเทรดกระดาษได้ก่อน',
       feat2_title: 'วิเคราะห์ข้อมูลเรียลไทม์',
       feat2_desc: 'กราฟสด Indicators เทคนิค และติดตามพอร์ตโฟลิโออัปเดตทุกวินาที',
       feat3_title: 'ความปลอดภัยระดับธนาคาร',
@@ -123,7 +123,7 @@ const t = (lang: string, key: string): string => {
       contact_email_field: 'อีเมล',
       contact_message: 'ข้อความ',
       contact_send: 'ส่งข้อความ',
-      footer_desc: 'ระบบเทรดอัตโนมัติที่ขับเคลื่อนด้วย AI สำหรับตลาด Cryptocurrency',
+      footer_desc: 'บอทเทรดแบบตามกฎ เริ่มจากเทรดกระดาษ สำหรับตลาด Cryptocurrency',
       footer_product: 'ผลิตภัณฑ์',
       footer_company: 'บริษัท',
       footer_rights: '© 2026 TradeBot Pro. สงวนลิขสิทธิ์ทั้งหมด',

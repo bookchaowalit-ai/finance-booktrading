@@ -5,7 +5,7 @@ import './globals.css';
 
 export const metadata = {
   title: 'BookFinance',
-  description: 'AI Financial Operating System',
+  description: 'Rule-based, paper-first crypto trading bots',
 };
 
 export default function RootLayout({

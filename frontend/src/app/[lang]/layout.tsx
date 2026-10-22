@@ -15,7 +15,7 @@ export function generateStaticParams() {
 
 export const metadata = {
   title: 'BookFinance',
-  description: 'AI Financial Operating System',
+  description: 'Rule-based, paper-first crypto trading bots',
 };
 
 interface LocaleLayoutProps {
