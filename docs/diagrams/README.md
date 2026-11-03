@@ -36,7 +36,7 @@ Central flow pack (read-only, pinned 8de42ee, 2026-08-19): `bookchaowalit/archit
 
 1. Live site เป็น frontend อย่างเดียว: `/api/*` บน `booktrading.bookchaowalit.com` ตอบ 502 `DNS_HOSTNAME_NOT_FOUND` (Vercel ไม่มี `BACKEND_URL`).
 2. AuthZ ปัจจุบันเป็น access matrix แบบ fail-closed — ข้อสรุป "most trading routes never check the token" ใน flow pack layer 6 ไม่จริงแล้ว.
-3. Kill switch gate อยู่ฝั่ง Python (`RealGridBot` → `check_order_allowed`) เท่านั้น; Go `/api/trade/order` ไม่มี risk check ของตัวเอง.
+3. Kill switch gate อยู่ฝั่ง Python (`RealGridBot` → `check_order_allowed`) เท่านั้น; Go `/api/trade/order` ไม่มี risk check ของตัวเอง; risk-per-trade ไม่ถูกบังคับกับ real grid order และ kill/halt ไม่ cancel open order ที่ exchange.
 4. DEX wallet private keys เข้ารหัสด้วย key คงที่ใน source (`wallet_service.go getEncryptionKey`).
 5. gRPC :9000 ไม่มี auth; WebSocket token ส่งทาง query string.
 6. ไม่มี backup ที่ implement จริง, ไม่มี uptime monitor, Prometheus metric ส่วนใหญ่ไม่ถูกบันทึก (`trades_failed_total` ที่ KPI plan อ้างไม่เคยเพิ่มค่า).

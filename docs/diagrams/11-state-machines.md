@@ -46,9 +46,11 @@ stateDiagram-v2
     Active --> Halted: daily loss, consecutive losses or drawdown over limit -> _halt()
     Halted --> Halted: daily reset keeps halt
     Halted --> Active: reset_kill_switch() via admin POST /api/risk/reset
+    Halted --> Active: admin POST /api/real-grid/enable, RealGridBot.enable() also calls reset_kill_switch()
     note right of Halted
         _halt also calls
-        get_real_grid_bot().disable()
+        get_real_grid_bot().disable(),
+        open exchange orders are not cancelled
     end note
 ```
 
