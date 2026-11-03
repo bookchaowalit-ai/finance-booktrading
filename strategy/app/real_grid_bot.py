@@ -1895,6 +1895,21 @@ class RealGridBot:
             logger.warning("Failed to fetch balances: %s", e)
         return {}
 
+    async def _account_value_quote(self, symbol: str, price: float) -> float:
+        """Free quote balance plus free base balance at ``price``, in quote units.
+
+        For a THB pair this is the THB value the pair can trade with. Returns
+        0.0 when balances cannot be fetched or the symbol format is unknown.
+        """
+        for quote in ["THB", "USDT", "BUSD", "BTC"]:
+            if symbol.endswith(quote):
+                base_asset = symbol[: -len(quote)]
+                break
+        else:
+            return 0.0
+        balances = await self._fetch_balances()
+        return balances.get(quote, 0.0) + balances.get(base_asset, 0.0) * price
+
     async def _can_place_sell(self, symbol: str, qty: float) -> bool:
         """Check if we have enough base asset to place a SELL order."""
         # Extract base asset from symbol (e.g., ETHTHB -> ETH, BTCTHB -> BTC)
@@ -2016,11 +2031,22 @@ class RealGridBot:
                 return False
 
         # ── Risk check before order ──
+        # A BUY adds exposure, so it is sized against the account value
+        # (risk_per_trade_pct). An unknown balance blocks the BUY rather than
+        # skipping the check. A SELL only reduces exposure and stays exempt.
+        risk_kwargs = {}
+        if side == "BUY":
+            account_value = await self._account_value_quote(cfg.symbol, price)
+            if account_value <= 0:
+                logger.info("[RealGrid %s] BUY blocked: account value unknown", cfg.symbol)
+                return False
+            risk_kwargs["current_balance_thb"] = account_value
         allowed, reason = self._risk.check_order_allowed(
             symbol=cfg.symbol,
             side=side,
             quantity=order_size,
             price=price,
+            **risk_kwargs,
         )
         if not allowed:
             logger.info("[RealGrid %s] Order blocked by risk: %s", cfg.symbol, reason)
