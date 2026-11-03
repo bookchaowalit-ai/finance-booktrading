@@ -140,6 +140,7 @@ func TestCriticalRouteLevels(t *testing.T) {
 		// The strategy kill switch stops the Go grid loop with the service token.
 		{"/api/bot/stop", http.MethodPost, AccessAdmin, true},
 		{"/api/trading/stop", http.MethodPost, AccessAdmin, true},
+		{"/api/bot/status", http.MethodGet, AccessUser, true},
 		{"/api/settings/import", http.MethodPost, AccessAdmin, false},
 		{"/api/settings/export", http.MethodPost, AccessAdmin, false},
 		{"/api/paper/reset", http.MethodPost, AccessAdmin, true},

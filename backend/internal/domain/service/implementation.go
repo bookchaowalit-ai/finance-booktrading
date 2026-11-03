@@ -332,12 +332,13 @@ type BotServiceImpl struct {
 	// WaitGroup per Start). Stop waits on runJoined, closed once that run's
 	// loops exit; stopPending stays set until a Stop has seen them exit, so a
 	// retried Stop never reports "not running" while a loop is still alive.
-	runLoops    *sync.WaitGroup
-	runJoined   chan struct{}
-	stopPending bool
-	startedAt   time.Time
-	ctx         context.Context
-	cancel      context.CancelFunc
+	runLoops       *sync.WaitGroup
+	runJoined      chan struct{}
+	stopPending    bool
+	stopFinalizing bool
+	startedAt      time.Time
+	ctx            context.Context
+	cancel         context.CancelFunc
 	// Grid trading fields
 	symbol      string
 	quantity    float64
@@ -659,12 +660,19 @@ func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	}
 
 	s.runningMu.Lock()
-	finish := s.stopPending
-	s.stopPending = false
+	finish := s.stopPending && !s.stopFinalizing
+	s.stopFinalizing = s.stopFinalizing || finish
 	s.runningMu.Unlock()
 	if !finish {
-		return nil // a concurrent Stop completed it
+		return nil // a concurrent Stop is completing it
 	}
+	// Start stays refused (stopPending) until the stopped status is written,
+	// so a new run's "active" cannot be overwritten by this stop.
+	defer func() {
+		s.runningMu.Lock()
+		s.stopPending, s.stopFinalizing = false, false
+		s.runningMu.Unlock()
+	}()
 
 	if err := s.botStatusRepo.SetActive(ctx, false); err != nil {
 		return fmt.Errorf("failed to update bot status: %w", err)
@@ -695,6 +703,7 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.TotalProfit = s.botStatus.TotalProfit
 	status.BotMode = s.botMode
 	if s.isRunning {
+		status.Symbol = s.symbol
 		startedAt := s.startedAt
 		status.StartedAt = &startedAt
 	}

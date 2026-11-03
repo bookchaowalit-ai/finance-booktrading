@@ -89,3 +89,47 @@ func TestRetriedStopAfterTimeoutStillReportsTimeout(t *testing.T) {
 		t.Fatalf("once stopped: got %v, want ErrBotNotRunning", err)
 	}
 }
+
+// blockingStatusRepo parks SetActive(false) until released, to hold Stop in
+// its finalization step.
+type blockingStatusRepo struct {
+	MockBotStatusRepository
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingStatusRepo) SetActive(ctx context.Context, active bool) error {
+	if !active {
+		close(b.entered)
+		<-b.release
+	}
+	return nil
+}
+
+func TestStartBlockedUntilStopFinalizes(t *testing.T) {
+	repo := &blockingStatusRepo{entered: make(chan struct{}), release: make(chan struct{})}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel, s.isRunning = ctx, cancel, true
+
+	done := make(chan error)
+	go func() { done <- s.Stop(context.Background()) }()
+	<-repo.entered
+	if err := s.Start(context.Background(), validGrid()); err == nil {
+		t.Fatal("Start must wait until Stop has finished writing the stopped status")
+	}
+	close(repo.release)
+	if err := <-done; err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
+// The kill switch drains the Go bot's symbol too, so status must report it.
+func TestStatusReportsRunningSymbol(t *testing.T) {
+	s := NewBotService(&MockBotStatusRepository{}, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.isRunning, s.symbol = true, "BTCUSDT"
+	st, err := s.GetStatus(context.Background())
+	if err != nil || st.Symbol != "BTCUSDT" {
+		t.Fatalf("got %+v err=%v, want symbol BTCUSDT", st, err)
+	}
+}

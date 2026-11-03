@@ -88,6 +88,9 @@ type BotStatus struct {
 	TotalTrades int        `json:"total_trades"`
 	TotalProfit float64    `json:"total_profit"`
 	BotMode     BotMode    `json:"bot_mode,omitempty"`
+	// Symbol is the symbol the running grid/auto loop trades; the strategy
+	// kill switch drains its open orders too.
+	Symbol string `json:"symbol,omitempty"`
 }
 
 // OrderRequest represents an incoming order request
