@@ -86,14 +86,14 @@ var routeAccess = map[string]routeRule{
 	"/api/orders":            userReadAdmin,
 	"/api/orders/":           userReadAdmin,
 	"/api/bot/start":         userReadAdmin,
-	"/api/bot/stop":          userReadAdmin,
-	"/api/bot/status":        userReadAdmin,
+	"/api/bot/stop":          serviceRule, // strategy kill switch stops the Go loop
+	"/api/bot/status":        serviceRule, // kill switch reads the Go bot's symbol
 	"/api/portfolio":         userReadAdmin,
 	"/api/trades":            userReadAdmin,
 	"/api/performance":       userReadAdmin,
 	"/api/trading/configure": userReadAdmin,
 	"/api/trading/start":     userReadAdmin,
-	"/api/trading/stop":      userReadAdmin,
+	"/api/trading/stop":      serviceRule, // strategy kill switch stops the Go loop
 	"/api/trading/status":    userReadAdmin,
 	"/api/trading/portfolio": userReadAdmin,
 

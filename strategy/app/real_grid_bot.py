@@ -121,6 +121,7 @@ class RealGridState:
     # ── Stop-loss tracking ──
     stop_loss_triggered: Dict[int, bool] = field(default_factory=dict)  # buy_price -> True if stop-loss sell placed
     stop_loss_orders: Dict[float, float] = field(default_factory=dict)  # buy_price -> limit price of the placed stop sell (for chase/re-place)
+    lot_qty: Dict[float, float] = field(default_factory=dict)  # buy_price -> base qty when it differs from order size (partial fills)
 
 
 # ── Per-symbol default configs ────────────────────────────────────────────────
@@ -323,6 +324,15 @@ class RealGridBot:
         self._running = False
         self._http: Optional[httpx.AsyncClient] = None
         self._enabled = True  # master kill switch
+        # Order placements between their first await and the POST; contain()
+        # waits for these so nothing lands on the exchange after the drain.
+        self._inflight_orders = 0
+        # Held by each tick round and by containment, so a drain never runs
+        # while sync / stale cancels are mutating the same state.
+        self._tick_lock = asyncio.Lock()
+        # (symbol, orderId) cancelled by a kill whose final execution is not
+        # known yet; every containment re-checks them.
+        self._unresolved_cancels: Dict[tuple, str] = {}  # -> order side
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -374,6 +384,7 @@ class RealGridBot:
                 "order_times": {str(k): v for k, v in state.order_times.items()},
                 "stop_loss_triggered": {str(k): v for k, v in state.stop_loss_triggered.items()},
                 "stop_loss_orders": {str(k): v for k, v in state.stop_loss_orders.items()},
+                "lot_qty": {str(k): v for k, v in state.lot_qty.items()},
             }
             await self._redis.set(f"real_grid:{symbol}:state", json.dumps(data))
         except Exception as e:
@@ -421,6 +432,7 @@ class RealGridBot:
             # Restore stop-loss tracking
             state.stop_loss_triggered = {float(k): v for k, v in data.get("stop_loss_triggered", {}).items()}
             state.stop_loss_orders = {float(k): v for k, v in data.get("stop_loss_orders", {}).items()}
+            state.lot_qty = {float(k): v for k, v in data.get("lot_qty", {}).items()}
             logger.info(
                 "Restored state for %s from Redis: buys=%d sells=%d pnl=%.2f cum_pnl=%.2f order_size=%.6f",
                 symbol, len(state.active_buys), len(state.active_sells), state.daily_pnl,
@@ -478,8 +490,11 @@ class RealGridBot:
                     await asyncio.sleep(30)
                     continue
 
-                for cfg in self.configs:
-                    await self._tick(cfg)
+                async with self._tick_lock:
+                    for cfg in self.configs:
+                        if not self._enabled:
+                            break  # killed mid-round: free the lock for containment
+                        await self._tick(cfg)
                 await asyncio.sleep(self.configs[0].poll_interval_sec)
             except asyncio.CancelledError:
                 break
@@ -501,19 +516,347 @@ class RealGridBot:
         if self._http:
             await self._http.aclose()
 
-    def enable(self):
-        """Re-enable the bot after kill switch."""
+    def _containment_running(self) -> bool:
+        task = getattr(self, "_contain_task", None)
+        return getattr(self, "_containing", 0) > 0 or (task is not None and not task.done())
+
+    def enable(self) -> bool:
+        """Re-enable the bot after a kill. Returns False while the risk manager is halted.
+
+        Enabling never clears a risk halt: reset it first, deliberately, via
+        ``RiskManager.reset_kill_switch()`` (``POST /api/risk/reset``). It is
+        also refused while a kill containment is still running.
+        """
+        if self._containment_running():
+            logger.warning("Real Grid Bot enable refused: kill containment still running")
+            return False
+        risk = get_risk_manager()
+        if risk.state.halted:
+            logger.warning(
+                "Real Grid Bot enable refused: risk manager halted (%s)", risk.state.halt_reason
+            )
+            return False
         self._enabled = True
         for state in self.states.values():
             state.halted = False
-        # Also reset risk manager kill switch
-        get_risk_manager().reset_kill_switch()
         logger.info("Real Grid Bot ENABLED")
+        return True
+
+    def _containment(self) -> "asyncio.Task":
+        """The running containment task, or a new one. Overlapping kills share it."""
+        task = getattr(self, "_contain_task", None)
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(self.contain())
+            self._contain_task = task
+        return task
 
     def disable(self):
-        """Kill switch — stop all trading."""
+        """Kill switch — stop all trading and start containment.
+
+        From inside the event loop (e.g. a risk halt during a tick) this
+        schedules containment; callers that can await should use ``kill()``.
+        """
         self._enabled = False
         logger.warning("Real Grid Bot KILLED — all trading halted")
+        try:
+            self._containment()
+        except RuntimeError:
+            logger.warning("No running event loop: open orders NOT cancelled; call kill()")
+
+    async def kill(self) -> Dict:
+        """Disable trading and wait for the (shared) containment to finish."""
+        self._enabled = False
+        logger.warning("Real Grid Bot KILLED — all trading halted")
+        return await asyncio.shield(self._containment())
+
+    INFLIGHT_WAIT_SEC = 30.0
+
+    def _rearm_stop_for_cancelled_sell(
+        self, state: RealGridState, sell_price: float, executed_qty: float = 0.0
+    ):
+        """Re-arm the stop-loss whose sell was confirmed cancelled (lot still open).
+
+        A partly filled stop sell shrinks the lot first; a fully sold lot is
+        closed instead of re-armed.
+        """
+        for buy, placed in list(state.stop_loss_orders.items()):
+            if placed != sell_price:
+                continue
+            state.stop_loss_orders.pop(buy, None)
+            base = self._lot_quantity(state, buy)
+            if executed_qty > 0 and base <= 0:
+                logger.warning(
+                    "[RealGrid %s] Partly filled stop for buy@%s but lot size unknown — re-arming unchanged",
+                    state.symbol, buy,
+                )
+            elif executed_qty > 0:
+                remaining = base - executed_qty
+                if remaining <= 1e-12:
+                    state.filled_buy_prices.pop(buy, None)
+                    state.buy_fill_prices.pop(buy, None)
+                    state.lot_qty.pop(buy, None)
+                    state.stop_loss_triggered.pop(buy, None)
+                    continue
+                state.lot_qty[buy] = remaining
+            state.stop_loss_triggered[buy] = False
+
+    def _lot_quantity(self, state: RealGridState, buy_price: float) -> float:
+        """Base quantity held by a lot: recorded size, else the order size."""
+        if buy_price in state.lot_qty:
+            return state.lot_qty[buy_price]
+        return state.current_order_size if state.current_order_size > 0 else 0.0
+
+    def _forget_cancelled_order(self, state: RealGridState, order_id: str, executed_qty: float = 0.0):
+        """Drop a confirmed-cancelled order from local state.
+
+        A BUY with executed quantity becomes an open lot of that size so
+        stop-loss covers it; a cancelled stop-loss SELL re-arms its stop for
+        whatever the lot still holds.
+        """
+        for price, oid in list(state.active_buys.items()):
+            if oid == order_id:
+                del state.active_buys[price]
+                if executed_qty > 0:
+                    state.filled_buy_prices[price] = 0
+                    state.buy_fill_prices[price] = time.time()
+                    state.lot_qty[price] = executed_qty
+        for price, oid in list(state.active_sells.items()):
+            if oid == order_id:
+                del state.active_sells[price]
+                self._apply_sell_cancel(state, price, executed_qty)
+        state.order_times.pop(order_id, None)
+
+    def _apply_sell_cancel(self, state: RealGridState, sell_price: float, executed_qty: float):
+        """Book a confirmed-cancelled SELL: re-arm its stop, or shrink the grid lot it sold from."""
+        if any(placed == sell_price for placed in state.stop_loss_orders.values()):
+            self._rearm_stop_for_cancelled_sell(state, sell_price, executed_qty)
+            return
+        if executed_qty <= 0 or not state.buy_fill_prices:
+            return
+        below = [p for p in state.buy_fill_prices if p < sell_price]
+        lot = max(below) if below else min(state.buy_fill_prices, key=state.buy_fill_prices.get)
+        base = self._lot_quantity(state, lot)
+        if base <= 0:
+            logger.warning(
+                "[RealGrid %s] Partly filled SELL @ %s but lot size unknown — review lot %s",
+                state.symbol, sell_price, lot,
+            )
+            return
+        remaining = base - executed_qty
+        if remaining <= 1e-12:
+            state.filled_buy_prices.pop(lot, None)
+            state.buy_fill_prices.pop(lot, None)
+            state.lot_qty.pop(lot, None)
+            state.stop_loss_triggered.pop(lot, None)
+            state.stop_loss_orders.pop(lot, None)
+        else:
+            state.lot_qty[lot] = remaining
+
+    async def _after_confirmed_sell_cancel(self, symbol: str, state: RealGridState, sell_price: float, order_id: str):
+        """Read the final executed quantity of a cancelled SELL, then book it.
+
+        If the exchange cannot tell us, nothing is re-armed (a stop sized for
+        the full lot could oversell); the lot is logged for review.
+        """
+        executed = await self._final_executed_qty(self._http, symbol, order_id)
+        if executed is None:
+            logger.error(
+                "[RealGrid %s] Cancelled SELL @ %s (order %s): executed qty unknown — "
+                "stop-loss not re-armed, review this lot",
+                symbol, sell_price, order_id,
+            )
+            return
+        self._apply_sell_cancel(state, sell_price, executed)
+
+    def _close_lot_for_sell(
+        self, cfg: RealGridConfig, state: RealGridState, sell_price: float, executed_qty: Optional[float]
+    ) -> tuple:
+        """Match a filled SELL to its lot; return (buy_price, quantity sold).
+
+        The quantity is the sell's executed quantity when known, else the
+        lot's recorded size. A sell smaller than its lot leaves the remainder
+        open (same entry time, stop-loss still armed).
+        """
+        lot_sizes = dict(state.lot_qty)
+        fill_times = dict(state.buy_fill_prices)
+        had_stop = dict(state.stop_loss_triggered)
+        buy_price = self._match_buy_for_sell(state, sell_price)
+        base = lot_sizes.get(buy_price) or self._sell_fill_qty(cfg, state, buy_price)
+        qty = executed_qty if executed_qty and executed_qty > 0 else base
+        if buy_price > 0 and qty < base - 1e-12:
+            state.filled_buy_prices[buy_price] = 0
+            state.buy_fill_prices[buy_price] = fill_times.get(buy_price, time.time())
+            state.lot_qty[buy_price] = base - qty
+            if buy_price in had_stop:
+                # The executed stop sell was partial; re-arm for the rest.
+                state.stop_loss_triggered[buy_price] = False
+        return buy_price, qty
+
+    def _sell_fill_qty(self, cfg: RealGridConfig, state: RealGridState, buy_price: float) -> float:
+        """Quantity a filled SELL closed: the lot's recorded size, else the order size."""
+        if buy_price in state.lot_qty:
+            return state.lot_qty[buy_price]
+        return state.current_order_size if state.current_order_size > 0 else cfg.order_size
+
+    async def _wait_inflight_orders(self) -> bool:
+        """Wait until no order placement is mid-flight. False on timeout."""
+        deadline = time.monotonic() + self.INFLIGHT_WAIT_SEC
+        while getattr(self, "_inflight_orders", 0) > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
+
+    async def _final_executed_qty(self, client, symbol: str, order_id: str):
+        """Executed quantity the exchange reports after a cancel, or None."""
+        if client is None or not hasattr(client, "get"):
+            return None
+        try:
+            resp = await client.get(
+                f"{BACKEND_API_BASE}/api/trade/order-status",
+                params={"symbol": symbol, "orderId": order_id},
+            )
+            if resp.status_code == 200:
+                return float(resp.json().get("executedQty") or 0)
+        except Exception as e:
+            logger.warning("Kill: order-status for %s %s failed: %s", symbol, order_id, e)
+        return None
+
+    async def _book_kill_cancel(self, client, result: Dict, symbol: str, order_id: str, side: str):
+        """Book one order containment cancelled, from its final executed quantity.
+
+        Unknown execution keeps the order in local state and in
+        _unresolved_cancels, so sync and the next containment re-check it.
+        """
+        # The open-orders snapshot can be stale: the order may have filled
+        # further before the cancel landed.
+        executed = await self._final_executed_qty(client, symbol, order_id)
+        if executed is None:
+            result["unreconciled"].append({"symbol": symbol, "orderId": int(order_id) if order_id.isdigit() else order_id})
+            self._unresolved_cancels[(symbol, order_id)] = side
+            return
+        if executed > 0:
+            # A real trade: keep its journal entry open.
+            result["partial_fills"].append({
+                "symbol": symbol,
+                "orderId": int(order_id) if order_id.isdigit() else order_id,
+                "side": side,
+                "executedQty": executed,
+            })
+        else:
+            try:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+            except Exception as e:
+                logger.warning("Journal exit (kill cancel) failed: %s", e)
+        state = self.states.get(symbol)
+        if state:
+            self._forget_cancelled_order(state, order_id, executed)
+
+    async def contain(self) -> Dict:
+        """Stop the Go bot loop, then cancel every open exchange order.
+
+        Order: stop the Go bot (its Stop joins its loops), read the symbols
+        it traded, wait for in-flight Python placements, then, holding the
+        tick lock, re-check earlier unresolved cancels and cancel every open
+        order on each configured and Go-traded symbol, reading each one's
+        final executed quantity. ``contained`` is
+        True only when all of that is confirmed.
+        """
+        client = self._http or httpx.AsyncClient(timeout=15.0, event_hooks=backend_event_hooks())
+        result: Dict = {
+            "go_bot_stopped": False,
+            "cancelled": 0,
+            "failed": [],
+            "partial_fills": [],
+            "unreconciled": [],
+            "inflight_settled": False,
+        }
+        self._containing = getattr(self, "_containing", 0) + 1
+        try:
+            try:
+                resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
+                # 409 = no Go bot loop running, which is what we want.
+                result["go_bot_stopped"] = resp.status_code in (200, 409)
+                if not result["go_bot_stopped"]:
+                    logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
+            except Exception as e:
+                logger.error("Kill: Go bot stop failed: %s", e)
+
+            # Stop and status run before the tick lock so a slow tick cannot
+            # delay halting the Go bot; only the drain waits for the tick.
+            # Read after the stop: Go keeps the run's traded symbols after Stop,
+            # and this includes any symbol a signal traded while stopping.
+            # Go symbols are remembered until a containment fully succeeds, so
+            # a retry after the Go bot stopped still drains them.
+            go_symbols = getattr(self, "_go_drain_symbols", None)
+            if go_symbols is None:
+                go_symbols = self._go_drain_symbols = set()
+            try:
+                resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                status = resp.json()
+                for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
+                    if sym:
+                        go_symbols.add(sym.upper())
+            except Exception as e:
+                logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
+                result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
+            # Placements already past their _enabled check finish (or bail at
+            # the pre-submit recheck) before the drain lists open orders.
+            result["inflight_settled"] = await self._wait_inflight_orders()
+            if not result["inflight_settled"]:
+                logger.error("Kill: order placement still in flight after %.0fs", self.INFLIGHT_WAIT_SEC)
+
+            async with self._tick_lock:
+                # Cancels from an earlier kill whose execution was unknown:
+                # they are off the book now, so only this re-check finds them.
+                for (symbol, order_id), side in list(self._unresolved_cancels.items()):
+                    del self._unresolved_cancels[(symbol, order_id)]
+                    await self._book_kill_cancel(client, result, symbol, order_id, side)
+                    if (symbol, order_id) not in self._unresolved_cancels and symbol in self.states:
+                        await self._save_state(symbol)
+
+                symbols = [cfg.symbol for cfg in self.configs]
+                symbols += sorted(sym for sym in go_symbols if sym not in symbols)
+
+                for symbol in symbols:
+                    try:
+                        resp = await client.get(
+                            f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": symbol}
+                        )
+                        resp.raise_for_status()
+                        orders = resp.json().get("orders") or []
+                    except Exception as e:
+                        logger.error("Kill: open orders for %s unavailable: %s", symbol, e)
+                        result["failed"].append({"symbol": symbol, "orderId": None})
+                        continue
+                    state = self.states.get(symbol)
+                    for order in orders:
+                        order_id = order.get("orderId")
+                        if not await self._cancel_order(symbol, str(order_id), client=client, close_journal=False):
+                            result["failed"].append({"symbol": symbol, "orderId": order_id})
+                            continue
+                        result["cancelled"] += 1
+                        await self._book_kill_cancel(client, result, symbol, str(order_id), order.get("side", ""))
+                    if state:
+                        await self._save_state(symbol)
+        finally:
+            self._containing -= 1
+            if client is not self._http:
+                await client.aclose()
+
+        result["contained"] = (
+            result["go_bot_stopped"]
+            and result["inflight_settled"]
+            and not result["failed"]
+            and not result["unreconciled"]
+        )
+        if result["contained"]:
+            self._go_drain_symbols = set()
+        log = logger.warning if result["contained"] else logger.error
+        log("Kill containment: %s", result)
+        return result
 
     def update_config(self, symbol: str, **kwargs) -> bool:
         """Update grid config for a symbol.
@@ -913,6 +1256,7 @@ class RealGridBot:
                         logger.warning("Journal exit (external cancel) failed: %s", e)
                     del state.active_sells[sell_price]
                     state.order_times.pop(oid, None)
+                    await self._after_confirmed_sell_cancel(cfg.symbol, state, sell_price, oid)
                     continue
                 if verdict == "unknown":
                     logger.warning(
@@ -920,10 +1264,10 @@ class RealGridBot:
                         cfg.symbol, sell_price, oid,
                     )
 
-                qty = state.current_order_size if state.current_order_size > 0 else cfg.order_size
-
-                # Match this sell against the correct open buy lot
-                actual_buy_price = self._match_buy_for_sell(state, sell_price)
+                # Match this sell against the correct open buy lot, sized by
+                # what the sell actually executed (a smaller fill shrinks the lot)
+                executed = await self._final_executed_qty(self._http, cfg.symbol, oid)
+                actual_buy_price, qty = self._close_lot_for_sell(cfg, state, sell_price, executed)
 
                 # Fees: 0.1% per side, each on its own notional (the old code
                 # charged the buy-side fee on the sell price, overstating it)
@@ -1060,6 +1404,8 @@ class RealGridBot:
 
                 del order_map[price]
                 state.order_times.pop(order_id, None)
+                if side == "SELL":
+                    await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
                 changed = True
                 logger.info(
                     "[RealGrid %s] Removed canceled %s @ %.10g from halted state",
@@ -1082,68 +1428,53 @@ class RealGridBot:
             await self._save_state(cfg.symbol)
 
     async def _cancel_stale_orders(self, cfg: RealGridConfig, state: RealGridState, current_price: float):
-        """Cancel orders that are too far from current price OR too old."""
+        """Cancel orders that are too far from current price OR too old.
+
+        Only orders the backend confirmed cancelled leave local state; a
+        failed cancel stays tracked so the next sync resolves it.
+        """
         threshold_pct = cfg.stale_threshold_pct / 100.0
         lower_bound = int(current_price * (1 - threshold_pct))
         upper_bound = int(current_price * (1 + threshold_pct))
         now = time.time()
 
-        # Cancel stale buy orders (too far below)
-        stale_buy_prices = [p for p in state.active_buys if p < lower_bound]
-        for price in stale_buy_prices:
-            order_id = state.active_buys[price]
-            await self._cancel_order(cfg.symbol, order_id)
-            state.order_times.pop(order_id, None)
-            del state.active_buys[price]
-            logger.info("[RealGrid %s] Cancelled stale BUY @ %d (price drift)", cfg.symbol, price)
+        def aged(order_id: str) -> bool:
+            return now - state.order_times.get(order_id, now) > self.MAX_ORDER_AGE_SECONDS
 
-        # Cancel stale sell orders (too far above)
-        stale_sell_prices = [p for p in state.active_sells if p > upper_bound]
-        for price in stale_sell_prices:
-            order_id = state.active_sells[price]
-            await self._cancel_order(cfg.symbol, order_id)
-            state.order_times.pop(order_id, None)
-            del state.active_sells[price]
-            logger.info("[RealGrid %s] Cancelled stale SELL @ %d (price drift)", cfg.symbol, price)
-
-        # Time-based stale: cancel orders older than MAX_ORDER_AGE_SECONDS
-        aged_buy_prices = []
-        for price, oid in state.active_buys.items():
-            placed_at = state.order_times.get(oid, now)
-            if now - placed_at > self.MAX_ORDER_AGE_SECONDS:
-                aged_buy_prices.append((price, oid))
-        for price, oid in aged_buy_prices:
-            await self._cancel_order(cfg.symbol, oid)
-            state.order_times.pop(oid, None)
-            del state.active_buys[price]
-            logger.info("[RealGrid %s] Cancelled aged BUY @ %d (time stale)", cfg.symbol, price)
-
-        aged_sell_prices = []
-        for price, oid in state.active_sells.items():
-            placed_at = state.order_times.get(oid, now)
-            if now - placed_at > self.MAX_ORDER_AGE_SECONDS:
-                aged_sell_prices.append((price, oid))
-        for price, oid in aged_sell_prices:
-            await self._cancel_order(cfg.symbol, oid)
-            state.order_times.pop(oid, None)
-            del state.active_sells[price]
-            logger.info("[RealGrid %s] Cancelled aged SELL @ %d (time stale)", cfg.symbol, price)
+        for side, book in (("BUY", state.active_buys), ("SELL", state.active_sells)):
+            for price, order_id in list(book.items()):
+                drift = price < lower_bound if side == "BUY" else price > upper_bound
+                if not drift and not aged(order_id):
+                    continue
+                if not await self._cancel_order(cfg.symbol, order_id):
+                    logger.warning(
+                        "[RealGrid %s] Cancel of stale %s @ %d not confirmed — keeping it tracked",
+                        cfg.symbol, side, price,
+                    )
+                    continue
+                state.order_times.pop(order_id, None)
+                del book[price]
+                if side == "SELL":
+                    await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
+                logger.info(
+                    "[RealGrid %s] Cancelled stale %s @ %d (%s)",
+                    cfg.symbol, side, price, "price drift" if drift else "time stale",
+                )
 
     async def _rebalance_grid(self, cfg: RealGridConfig, state: RealGridState):
         """Cancel all open orders and clear state for fresh grid placement.
-        
+
         Called after daily reset to ensure orders are placed at current price levels
-        rather than stale levels from previous day.
+        rather than stale levels from previous day. Sells matched to filled buys
+        are kept (Fix 5); an order whose cancel is not confirmed stays tracked.
         """
         logger.info("[RealGrid %s] Rebalancing grid — cancelling all open orders", cfg.symbol)
-        
-        # Cancel all active buy orders
+
         for price, order_id in list(state.active_buys.items()):
-            await self._cancel_order(cfg.symbol, order_id)
-            logger.debug("[RealGrid %s] Cancelled BUY @ %d", cfg.symbol, price)
-        state.active_buys.clear()
-        
-        # Cancel sell orders EXCEPT those matched to filled buys (Fix 5)
+            if await self._cancel_order(cfg.symbol, order_id):
+                del state.active_buys[price]
+                logger.debug("[RealGrid %s] Cancelled BUY @ %d", cfg.symbol, price)
+
         for price, order_id in list(state.active_sells.items()):
             if price in state.filled_buy_prices:
                 logger.info(
@@ -1151,33 +1482,37 @@ class RealGridBot:
                     cfg.symbol, price, price,
                 )
                 continue
-            await self._cancel_order(cfg.symbol, order_id)
-            logger.debug("[RealGrid %s] Cancelled SELL @ %d", cfg.symbol, price)
-        state.active_sells = {
-            p: oid for p, oid in state.active_sells.items() if p in state.filled_buy_prices
-        }
-        
+            if await self._cancel_order(cfg.symbol, order_id):
+                del state.active_sells[price]
+                await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
+                logger.debug("[RealGrid %s] Cancelled SELL @ %d", cfg.symbol, price)
+
         logger.info("[RealGrid %s] Grid rebalanced — will place fresh orders at next tick", cfg.symbol)
 
-    async def _cancel_order(self, symbol: str, order_id: str):
-        """Cancel an order via backend."""
+    async def _cancel_order(self, symbol: str, order_id: str, client=None, close_journal: bool = True) -> bool:
+        """Cancel an order via backend. Returns True when the backend confirmed it."""
+        client = client or self._http
         try:
-            resp = await self._http.post(
+            resp = await client.post(
                 f"{BACKEND_API_BASE}/api/trade/cancel-order",
                 json={"symbol": symbol, "orderId": int(order_id)},
             )
             if resp.status_code != 200:
                 logger.warning("Failed to cancel order %s: %s", order_id, resp.text)
-            else:
-                # Close the journal entry so cancelled orders don't sit
-                # in the journal as OPEN forever (they'd otherwise dominate
-                # open_entries and make the stats meaningless)
-                try:
-                    await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
-                except Exception as e:
-                    logger.warning("Journal exit (cancel) failed: %s", e)
+                return False
+            if not close_journal:
+                return True
+            # Close the journal entry so cancelled orders don't sit
+            # in the journal as OPEN forever (they'd otherwise dominate
+            # open_entries and make the stats meaningless)
+            try:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+            except Exception as e:
+                logger.warning("Journal exit (cancel) failed: %s", e)
+            return True
         except Exception as e:
             logger.warning("Cancel order failed: %s", e)
+            return False
 
     async def _update_pnl(self, cfg: RealGridConfig, state: RealGridState):
         """PnL is now calculated in _sync_open_orders() when fills are detected.
@@ -1609,6 +1944,7 @@ class RealGridBot:
         # Position closed — drop any stop-loss bookkeeping for this lot
         state.stop_loss_triggered.pop(matched, None)
         state.stop_loss_orders.pop(matched, None)
+        state.lot_qty.pop(matched, None)
         return matched
 
     # Re-place an unfilled stop-loss sell when price falls this % below its
@@ -1642,8 +1978,10 @@ class RealGridBot:
                 if placed_price is None:
                     continue  # legacy state from before chase tracking existed
                 if placed_price not in state.active_sells:
-                    # Order left the book (filled or cancelled) — fill detection
-                    # handles the accounting; stop tracking it here
+                    # Order left the book with an outcome we did not confirm
+                    # here (it may have filled), so do not place a second
+                    # stop. Confirmed cancellations re-arm the stop where they
+                    # happen (_rearm_stop_for_cancelled_sell).
                     state.stop_loss_orders.pop(buy_price, None)
                     continue
                 # Chase: price fell well below our resting limit — it won't fill
@@ -1672,7 +2010,9 @@ class RealGridBot:
                     cfg.symbol, buy_price, sell_price, drop_pct * 100, cfg.stop_loss_pct
                 )
 
-                placed = await self._place_grid_order(cfg, state, "SELL", sell_price)
+                placed = await self._place_grid_order(
+                    cfg, state, "SELL", sell_price, quantity=state.lot_qty.get(buy_price)
+                )
                 if not placed:
                     # Do NOT mark triggered — the position is still unprotected.
                     # Next tick retries. This was the original bug: a rate-limited
@@ -1895,6 +2235,21 @@ class RealGridBot:
             logger.warning("Failed to fetch balances: %s", e)
         return {}
 
+    async def _account_value_quote(self, symbol: str, price: float) -> float:
+        """Free quote balance plus free base balance at ``price``, in quote units.
+
+        For a THB pair this is the THB value the pair can trade with. Returns
+        0.0 when balances cannot be fetched or the symbol format is unknown.
+        """
+        for quote in ["THB", "USDT", "BUSD", "BTC"]:
+            if symbol.endswith(quote):
+                base_asset = symbol[: -len(quote)]
+                break
+        else:
+            return 0.0
+        balances = await self._fetch_balances()
+        return balances.get(quote, 0.0) + balances.get(base_asset, 0.0) * price
+
     async def _can_place_sell(self, symbol: str, qty: float) -> bool:
         """Check if we have enough base asset to place a SELL order."""
         # Extract base asset from symbol (e.g., ETHTHB -> ETH, BTCTHB -> BTC)
@@ -1960,7 +2315,9 @@ class RealGridBot:
         )
         return True
 
-    async def _place_grid_order(self, cfg: RealGridConfig, state: RealGridState, side: str, price: float) -> bool:
+    async def _place_grid_order(
+        self, cfg: RealGridConfig, state: RealGridState, side: str, price: float, quantity: Optional[float] = None
+    ) -> bool:
         """Place a real LIMIT order at a grid level via Go backend.
 
         Returns True only when the exchange accepted the order — callers that
@@ -1974,8 +2331,19 @@ class RealGridBot:
             )
             return False
 
+        self._inflight_orders = getattr(self, "_inflight_orders", 0) + 1
+        try:
+            return await self._place_grid_order_inner(cfg, state, side, price, quantity)
+        finally:
+            self._inflight_orders -= 1
+
+    async def _place_grid_order_inner(
+        self, cfg: RealGridConfig, state: RealGridState, side: str, price: float, quantity: Optional[float] = None
+    ) -> bool:
         # Use dynamic order size from auto-compounding if available, else base config size
         order_size = state.current_order_size if state.current_order_size > 0 else cfg.order_size
+        if quantity is not None and quantity > 0:
+            order_size = quantity  # e.g. a stop-loss sell for a partly filled lot
 
         # Global guards apply before any balance check or backend request.  A
         # BUY adds exposure; a SELL remains available so a full portfolio can
@@ -2016,14 +2384,31 @@ class RealGridBot:
                 return False
 
         # ── Risk check before order ──
+        # A BUY adds exposure, so it is sized against the account value
+        # (risk_per_trade_pct). An unknown balance blocks the BUY rather than
+        # skipping the check. A SELL only reduces exposure and stays exempt.
+        risk_kwargs = {}
+        if side == "BUY":
+            account_value = await self._account_value_quote(cfg.symbol, price)
+            if account_value <= 0:
+                logger.info("[RealGrid %s] BUY blocked: account value unknown", cfg.symbol)
+                return False
+            risk_kwargs["current_balance_thb"] = account_value
         allowed, reason = self._risk.check_order_allowed(
             symbol=cfg.symbol,
             side=side,
             quantity=order_size,
             price=price,
+            **risk_kwargs,
         )
         if not allowed:
             logger.info("[RealGrid %s] Order blocked by risk: %s", cfg.symbol, reason)
+            return False
+
+        # A kill may have landed while this placement awaited balances or the
+        # risk check; never submit after it.
+        if not self._enabled:
+            logger.warning("[RealGrid %s] %s @ %.2f dropped: bot killed mid-placement", cfg.symbol, side, price)
             return False
 
         try:

@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -327,9 +329,19 @@ type BotServiceImpl struct {
 	exchangeManager *exchange.ExchangeManager // pointer so nil comparison works
 	isRunning       bool
 	runningMu       sync.RWMutex
-	startedAt       time.Time
-	ctx             context.Context
-	cancel          context.CancelFunc
+	// runLoops tracks the trading goroutines of the current run (a fresh
+	// WaitGroup per Start). Stop waits on runJoined, closed once that run's
+	// loops exit; stopPending stays set until a Stop has seen them exit, so a
+	// retried Stop never reports "not running" while a loop is still alive.
+	runLoops       *sync.WaitGroup
+	tradedMu       sync.Mutex
+	tradedSymbols  map[string]bool
+	runJoined      chan struct{}
+	stopPending    bool
+	stopFinalizing bool
+	startedAt      time.Time
+	ctx            context.Context
+	cancel         context.CancelFunc
 	// Grid trading fields
 	symbol      string
 	quantity    float64
@@ -464,6 +476,10 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	if s.isRunning {
 		return fmt.Errorf("bot is already running")
 	}
+	if s.stopPending {
+		return fmt.Errorf("previous run is still stopping")
+	}
+	s.runLoops = &sync.WaitGroup{}
 
 	mode := resolveBotMode(params)
 	if mode == model.BotModeGrid {
@@ -474,6 +490,15 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 
 	if err := s.botStatusRepo.SetActive(ctx, true); err != nil {
 		return fmt.Errorf("failed to update bot status: %w", err)
+	}
+
+	// The previous run's traded symbols stay listed until this run has
+	// really started, so a failed Start cannot hide them from a kill retry.
+	s.tradedMu.Lock()
+	s.tradedSymbols = nil
+	s.tradedMu.Unlock()
+	if params != nil && params.Symbol != "" {
+		s.noteTradedSymbol(params.Symbol)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -545,7 +570,7 @@ func (s *BotServiceImpl) startGridMode(ctx context.Context, params *input.BotSta
 	})
 
 	logger.Info("Grid trading bot started", "symbol", grid.symbol, "grid_levels", grid.gridLevels)
-	go s.gridTradingLoop(ctx, grid)
+	s.goLoop(func() { s.gridTradingLoop(ctx, grid) })
 }
 
 // startSignalMode must be called with runningMu held.
@@ -558,7 +583,8 @@ func (s *BotServiceImpl) startSignalMode(ctx context.Context) {
 	})
 
 	logger.Info("Trading bot started (signal mode)")
-	go s.listenForOrderSignals(ctx, withSignalDefaults(s.signalConfig))
+	cfg := withSignalDefaults(s.signalConfig)
+	s.goLoop(func() { s.listenForOrderSignals(ctx, cfg) })
 }
 
 // startAutoMode must be called with runningMu held.
@@ -568,6 +594,7 @@ func (s *BotServiceImpl) startAutoMode(ctx context.Context) {
 		symbol = "BTCUSDT"
 	}
 	s.symbol = symbol
+	s.noteTradedSymbol(symbol)
 
 	s.broadcaster.BroadcastBotActivity(&model.BotActivity{
 		Timestamp: time.Now(),
@@ -579,29 +606,110 @@ func (s *BotServiceImpl) startAutoMode(ctx context.Context) {
 	})
 
 	logger.Info("Auto-adjust bot started", "symbol", symbol, "risk", s.signalConfig.RiskLevel)
-	go s.autoTradingLoop(ctx, withSignalDefaults(s.signalConfig))
+	cfg := withSignalDefaults(s.signalConfig)
+	s.goLoop(func() { s.autoTradingLoop(ctx, cfg) })
 }
 
-// Stop stops the trading bot
+// ErrBotStopTimeout means Stop cancelled the run but a trading loop did not
+// exit within botStopJoinTimeout, so an order may still be in flight.
+var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time")
+
+// botStopJoinTimeout bounds how long Stop waits for the loops to exit.
+var botStopJoinTimeout = 30 * time.Second
+
+// noteTradedSymbol records a symbol this run may hold orders on.
+func (s *BotServiceImpl) noteTradedSymbol(symbol string) {
+	if symbol == "" {
+		return
+	}
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	if s.tradedSymbols == nil {
+		s.tradedSymbols = make(map[string]bool)
+	}
+	s.tradedSymbols[symbol] = true
+}
+
+func (s *BotServiceImpl) tradedSymbolList() []string {
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	out := make([]string, 0, len(s.tradedSymbols))
+	for sym := range s.tradedSymbols {
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// goLoop runs a trading loop of the current run. Callers hold runningMu.
+func (s *BotServiceImpl) goLoop(fn func()) {
+	if s.runLoops == nil {
+		s.runLoops = &sync.WaitGroup{}
+	}
+	wg := s.runLoops
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fn()
+	}()
+}
+
+// Stop stops the trading bot and waits for its loops to exit. The loops take
+// runningMu, so the wait happens after the lock is released.
 func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.runningMu.Lock()
-	defer s.runningMu.Unlock()
+	switch {
+	case s.isRunning:
+		s.cancel()
+		s.isRunning = false
+		// Reset grid trading state
+		s.symbol = ""
+		s.quantity = 0
+		s.gridLevels = 0
+		s.lowerPrice = 0
+		s.upperPrice = 0
+		s.investment = 0
+		s.signalConfig = input.SignalConfig{}
+		s.positions = make(map[string]*positionInfo)
 
-	if !s.isRunning {
-		return fmt.Errorf("bot is not running")
+		wg := s.runLoops
+		joined := make(chan struct{})
+		go func() {
+			if wg != nil {
+				wg.Wait()
+			}
+			close(joined)
+		}()
+		s.runJoined = joined
+		s.stopPending = true
+	case !s.stopPending:
+		s.runningMu.Unlock()
+		return input.ErrBotNotRunning
+	}
+	joined := s.runJoined
+	s.runningMu.Unlock()
+
+	select {
+	case <-joined:
+	case <-time.After(botStopJoinTimeout):
+		logger.Error("Trading loop did not exit after stop", "timeout", botStopJoinTimeout)
+		return ErrBotStopTimeout
 	}
 
-	s.cancel()
-	s.isRunning = false
-	// Reset grid trading state
-	s.symbol = ""
-	s.quantity = 0
-	s.gridLevels = 0
-	s.lowerPrice = 0
-	s.upperPrice = 0
-	s.investment = 0
-	s.signalConfig = input.SignalConfig{}
-	s.positions = make(map[string]*positionInfo)
+	s.runningMu.Lock()
+	finish := s.stopPending && !s.stopFinalizing
+	s.stopFinalizing = s.stopFinalizing || finish
+	s.runningMu.Unlock()
+	if !finish {
+		return nil // a concurrent Stop is completing it
+	}
+	// Start stays refused (stopPending) until the stopped status is written,
+	// so a new run's "active" cannot be overwritten by this stop.
+	defer func() {
+		s.runningMu.Lock()
+		s.stopPending, s.stopFinalizing = false, false
+		s.runningMu.Unlock()
+	}()
 
 	if err := s.botStatusRepo.SetActive(ctx, false); err != nil {
 		return fmt.Errorf("failed to update bot status: %w", err)
@@ -631,7 +739,9 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.TotalTrades = s.botStatus.TotalTrades
 	status.TotalProfit = s.botStatus.TotalProfit
 	status.BotMode = s.botMode
+	status.Symbols = s.tradedSymbolList()
 	if s.isRunning {
+		status.Symbol = s.symbol
 		startedAt := s.startedAt
 		status.StartedAt = &startedAt
 	}
@@ -871,6 +981,7 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
+	s.noteTradedSymbol(symbol)
 	// Determine quantity from risk config
 	quantity := cfg.Quantity
 	if quantity <= 0 {
@@ -1055,6 +1166,7 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
+	s.noteTradedSymbol(grid.symbol)
 	s.runningMu.RLock()
 	running := s.isRunning
 	client := s.tradingClient

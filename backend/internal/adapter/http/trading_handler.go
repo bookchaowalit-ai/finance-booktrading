@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -124,8 +125,12 @@ func (h *TradingHandler) StopBot(w http.ResponseWriter, r *http.Request) {
 
 	err := h.botService.Stop(r.Context())
 	if err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, input.ErrBotNotRunning) {
+			code = http.StatusConflict
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]string{
 			"error": err.Error(),
 		})

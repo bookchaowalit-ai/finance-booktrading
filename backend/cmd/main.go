@@ -207,6 +207,14 @@ func main() {
 		logger.Info("DEX manager initialization", "error", err)
 	}
 	dexCancel()
+	// DEX wallets sign with keys sealed by DEX_WALLET_ENCRYPTION_KEY; with DEX
+	// on and no key, refuse to start rather than run with wallets unusable.
+	if cfg.Dex.Enabled {
+		if err := service.ValidateDexWalletKey(); err != nil {
+			logger.Error("DEX is enabled but the wallet encryption key is unusable", "error", err)
+			os.Exit(1)
+		}
+	}
 	walletService := service.NewWalletService(db.Pool, &cfg.Dex)
 	txSigner := service.NewTxSigner(walletService)
 	dexManager.SetSigner(txSigner)
@@ -589,6 +597,7 @@ func main() {
 	}()
 
 	// Start gRPC server
+	grpcServer.SetServiceToken(os.Getenv("AUTH_TOKEN"))
 	if err := grpcServer.Start(); err != nil {
 		logger.Error("Failed to start gRPC server", "error", err)
 	}

@@ -2,8 +2,10 @@ package grpcserver
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 	"trading-bot-system/backend/internal/adapter/dex"
@@ -15,6 +17,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -33,6 +36,11 @@ type GRPCServer struct {
 	server *grpc.Server
 	port   string
 	mu     sync.Mutex
+
+	// serviceToken is the shared AUTH_TOKEN every call must present as
+	// "authorization: Bearer <token>" metadata. Start refuses to serve
+	// without one.
+	serviceToken string
 
 	// Market data subscribers
 	subscribers map[chan *pb.MarketData]bool
@@ -57,8 +65,17 @@ func NewGRPCServer(
 	}
 }
 
+// SetServiceToken sets the bearer token callers must send.
+func (s *GRPCServer) SetServiceToken(token string) {
+	s.serviceToken = token
+}
+
 // Start starts the gRPC server
 func (s *GRPCServer) Start() error {
+	if s.serviceToken == "" {
+		return fmt.Errorf("gRPC service token is empty: set AUTH_TOKEN; refusing to serve unauthenticated order execution")
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", s.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
@@ -279,6 +296,10 @@ func (s *GRPCServer) unaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
+	if err := s.authorize(ctx); err != nil {
+		logger.Warn("gRPC call rejected", "method", info.FullMethod)
+		return nil, err
+	}
 	start := time.Now()
 
 	resp, err := handler(ctx, req)
@@ -295,6 +316,10 @@ func (s *GRPCServer) streamInterceptor(
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
+	if err := s.authorize(ss.Context()); err != nil {
+		logger.Warn("gRPC stream rejected", "method", info.FullMethod)
+		return err
+	}
 	start := time.Now()
 
 	err := handler(srv, ss)
@@ -303,4 +328,17 @@ func (s *GRPCServer) streamInterceptor(
 	logger.Info("gRPC stream request completed", "method", info.FullMethod, "duration", duration)
 
 	return err
+}
+
+// authorize checks the bearer token in the incoming metadata.
+func (s *GRPCServer) authorize(ctx context.Context) error {
+	md, _ := metadata.FromIncomingContext(ctx)
+	for _, v := range md.Get("authorization") {
+		token, ok := strings.CutPrefix(v, "Bearer ")
+		if ok && s.serviceToken != "" &&
+			subtle.ConstantTimeCompare([]byte(token), []byte(s.serviceToken)) == 1 {
+			return nil
+		}
+	}
+	return status.Error(codes.Unauthenticated, "missing or invalid service token")
 }

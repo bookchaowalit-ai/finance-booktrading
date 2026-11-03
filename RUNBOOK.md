@@ -24,8 +24,22 @@ Detected: Docker marker=yes; npm scripts sample=['dev', 'build', 'start', 'lint'
 | JWT / SECRET_KEY | Backend auth — rotate if leaked |
 | Public API base URL | Frontend `NEXT_PUBLIC_*` style |
 | OAuth / third-party | Optional; leave disabled for demos |
+| `DEX_WALLET_ENCRYPTION_KEY` | 32+ chars, Infisical. Seals `dex_wallets` private keys; backend refuses to start with `DEX_ENABLED=true` and no key. Separate from `ENCRYPTION_KEY` |
 
 Use `.env.example` when present. **Do not** commit `.env`.
+
+## Re-key DEX wallets (one time, owner-approved)
+
+Before 2026-11-03 wallet keys were sealed with a constant in `wallet_service.go`,
+which is public in git history. Rows sealed that way no longer open. To move
+them to `DEX_WALLET_ENCRYPTION_KEY`:
+
+1. Back up the database.
+2. Dry run (changes nothing; lists legacy rows by address):
+   `DATABASE_URL=... DEX_WALLET_ENCRYPTION_KEY=... go run ./cmd/rekey-dex-wallets` (from `backend/`)
+3. Any listed address that holds funds was readable by anyone with the repo:
+   move the funds to a fresh wallet first, then retire the old one.
+4. With owner approval: run again with `-apply` (one transaction).
 
 ## Run (local)
 
