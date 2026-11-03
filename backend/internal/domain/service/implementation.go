@@ -480,12 +480,6 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 		return fmt.Errorf("previous run is still stopping")
 	}
 	s.runLoops = &sync.WaitGroup{}
-	s.tradedMu.Lock()
-	s.tradedSymbols = nil
-	s.tradedMu.Unlock()
-	if params != nil && params.Symbol != "" {
-		s.noteTradedSymbol(params.Symbol)
-	}
 
 	mode := resolveBotMode(params)
 	if mode == model.BotModeGrid {
@@ -496,6 +490,15 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 
 	if err := s.botStatusRepo.SetActive(ctx, true); err != nil {
 		return fmt.Errorf("failed to update bot status: %w", err)
+	}
+
+	// The previous run's traded symbols stay listed until this run has
+	// really started, so a failed Start cannot hide them from a kill retry.
+	s.tradedMu.Lock()
+	s.tradedSymbols = nil
+	s.tradedMu.Unlock()
+	if params != nil && params.Symbol != "" {
+		s.noteTradedSymbol(params.Symbol)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())

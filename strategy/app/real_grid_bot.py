@@ -492,6 +492,8 @@ class RealGridBot:
 
                 async with self._tick_lock:
                     for cfg in self.configs:
+                        if not self._enabled:
+                            break  # killed mid-round: free the lock for containment
                         await self._tick(cfg)
                 await asyncio.sleep(self.configs[0].poll_interval_sec)
             except asyncio.CancelledError:
@@ -753,10 +755,11 @@ class RealGridBot:
     async def contain(self) -> Dict:
         """Stop the Go bot loop, then cancel every open exchange order.
 
-        Order: wait for in-flight Python placements, read which symbol the Go
-        bot trades, stop it (Go Stop waits for its loops), then cancel every
-        open order on each configured symbol plus the Go bot's symbol, and
-        read each cancelled order's final executed quantity. ``contained`` is
+        Order: stop the Go bot (its Stop joins its loops), read the symbols
+        it traded, wait for in-flight Python placements, then, holding the
+        tick lock, re-check earlier unresolved cancels and cancel every open
+        order on each configured and Go-traded symbol, reading each one's
+        final executed quantity. ``contained`` is
         True only when all of that is confirmed.
         """
         client = self._http or httpx.AsyncClient(timeout=15.0, event_hooks=backend_event_hooks())
@@ -770,6 +773,35 @@ class RealGridBot:
         }
         self._containing = getattr(self, "_containing", 0) + 1
         try:
+            try:
+                resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
+                # 409 = no Go bot loop running, which is what we want.
+                result["go_bot_stopped"] = resp.status_code in (200, 409)
+                if not result["go_bot_stopped"]:
+                    logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
+            except Exception as e:
+                logger.error("Kill: Go bot stop failed: %s", e)
+
+            # Stop and status run before the tick lock so a slow tick cannot
+            # delay halting the Go bot; only the drain waits for the tick.
+            # Read after the stop: Go keeps the run's traded symbols after Stop,
+            # and this includes any symbol a signal traded while stopping.
+            # Go symbols are remembered until a containment fully succeeds, so
+            # a retry after the Go bot stopped still drains them.
+            go_symbols = getattr(self, "_go_drain_symbols", None)
+            if go_symbols is None:
+                go_symbols = self._go_drain_symbols = set()
+            try:
+                resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                status = resp.json()
+                for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
+                    if sym:
+                        go_symbols.add(sym.upper())
+            except Exception as e:
+                logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
+                result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
             # Placements already past their _enabled check finish (or bail at
             # the pre-submit recheck) before the drain lists open orders.
             result["inflight_settled"] = await self._wait_inflight_orders()
@@ -785,33 +817,6 @@ class RealGridBot:
                     if (symbol, order_id) not in self._unresolved_cancels and symbol in self.states:
                         await self._save_state(symbol)
 
-                try:
-                    resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
-                    # 409 = no Go bot loop running, which is what we want.
-                    result["go_bot_stopped"] = resp.status_code in (200, 409)
-                    if not result["go_bot_stopped"]:
-                        logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
-                except Exception as e:
-                    logger.error("Kill: Go bot stop failed: %s", e)
-
-                # Read after the stop: Go keeps the run's traded symbols after Stop,
-                # and this includes any symbol a signal traded while stopping.
-                # Go symbols are remembered until a containment fully succeeds, so
-                # a retry after the Go bot stopped still drains them.
-                go_symbols = getattr(self, "_go_drain_symbols", None)
-                if go_symbols is None:
-                    go_symbols = self._go_drain_symbols = set()
-                try:
-                    resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
-                    if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}")
-                    status = resp.json()
-                    for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
-                        if sym:
-                            go_symbols.add(sym.upper())
-                except Exception as e:
-                    logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
-                    result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
                 symbols = [cfg.symbol for cfg in self.configs]
                 symbols += sorted(sym for sym in go_symbols if sym not in symbols)
 

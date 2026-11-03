@@ -158,3 +158,20 @@ func TestStatusListsTradedSymbolsAfterStop(t *testing.T) {
 	}
 	s.Stop(context.Background())
 }
+
+// A Start that fails must not wipe the symbols a kill retry still has to drain.
+func TestFailedStartKeepsPreviousTradedSymbols(t *testing.T) {
+	s := newRunningBot(t)
+	s.noteTradedSymbol("ETHUSDT")
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.botStatusRepo = &failingBotStatusRepo{}
+	if err := s.Start(context.Background(), validGrid()); err == nil {
+		t.Fatal("start should fail when status cannot be persisted")
+	}
+	st, _ := s.GetStatus(context.Background())
+	if strings.Join(st.Symbols, ",") != "ETHUSDT" {
+		t.Fatalf("got %v, want the previous run's ETHUSDT", st.Symbols)
+	}
+}

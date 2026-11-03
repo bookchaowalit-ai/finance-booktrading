@@ -436,6 +436,7 @@ async def test_containment_waits_for_the_running_tick(monkeypatch):
         kill = asyncio.create_task(bot.kill())
         await asyncio.sleep(0.05)
         assert not any(u.endswith("/api/trade/cancel-order") for u, _ in posted), "drained during a tick"
+        assert any(u.endswith("/api/bot/stop") for u, _ in posted), "the Go stop must not wait for the tick"
     await kill
     assert any(u.endswith("/api/trade/cancel-order") for u, _ in posted)
 
