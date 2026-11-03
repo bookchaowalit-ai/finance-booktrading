@@ -163,6 +163,33 @@ func (r *PostgresBotStatusRepository) UpdateProfit(ctx context.Context, profit f
 	return err
 }
 
+// AddTradedSymbol records a symbol the bot traded (idempotent).
+func (r *PostgresBotStatusRepository) AddTradedSymbol(ctx context.Context, symbol string) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO bot_traded_symbols (symbol) VALUES ($1)
+		ON CONFLICT (symbol) DO NOTHING
+	`, symbol)
+	return err
+}
+
+// ListTradedSymbols returns every symbol the bot has traded.
+func (r *PostgresBotStatusRepository) ListTradedSymbols(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT symbol FROM bot_traded_symbols ORDER BY symbol`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
 // PostgresMarketDataRepository implements MarketDataRepository with PostgreSQL + TimescaleDB
 type PostgresMarketDataRepository struct {
 	pool *pgxpool.Pool
@@ -235,3 +262,5 @@ func (r *PostgresMarketDataRepository) GetPriceHistory(ctx context.Context, symb
 	}
 	return result, rows.Err()
 }
+
+var _ repository.TradedSymbolStore = (*PostgresBotStatusRepository)(nil)

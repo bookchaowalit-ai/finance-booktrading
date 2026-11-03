@@ -196,6 +196,22 @@ configured symbol. A risk-manager halt does the same automatically. Read the
 response: `contained: false` means the Go loop was not confirmed stopped or an
 order could not be cancelled (`failed` lists them) — check the exchange by hand.
 
+It is also false while an order's outcome is unknown:
+- `failed` entries with `reason: go_unresolved` are Go submissions the
+  exchange has not confirmed yet (Go lists them in `/api/bot/status`
+  `unresolved_orders` and re-checks them on every stop).
+- `uncertain` lists Python order POSTs that timed out or got a 5xx. Retry the
+  kill after 60 s: an open-orders listing from then on would show the order
+  if it went live, and the kill cancels it.
+
+The Go bot stores every traded symbol in `bot_traded_symbols` (migration 023),
+so a kill after a backend restart still drains them. If that table cannot be
+written, the Go bot refuses to trade.
+
+Partly filled SELLs that a kill or stale-order cancel stops are booked like
+fills: their realized PnL reaches the daily-loss and drawdown guards and the
+journal (`PARTIAL_SELL_CANCELLED`).
+
 Resuming is two explicit steps; neither implies the other:
 
 1. `POST /strategy-api/api/risk/reset` clears the risk halt only.

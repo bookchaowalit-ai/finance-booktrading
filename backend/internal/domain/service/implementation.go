@@ -333,9 +333,14 @@ type BotServiceImpl struct {
 	// WaitGroup per Start). Stop waits on runJoined, closed once that run's
 	// loops exit; stopPending stays set until a Stop has seen them exit, so a
 	// retried Stop never reports "not running" while a loop is still alive.
-	runLoops       *sync.WaitGroup
-	tradedMu       sync.Mutex
-	tradedSymbols  map[string]bool
+	runLoops      *sync.WaitGroup
+	tradedMu      sync.Mutex
+	tradedSymbols map[string]bool
+	// unresolved holds submissions a stopped loop left with an unknown
+	// outcome, keyed by client order ID; Stop looks them up (see
+	// reconcileUnresolved). orderLookup builds the exchange view for that.
+	unresolved     map[string]unresolvedOrder
+	orderLookup    func(symbol string) gridExchange
 	runJoined      chan struct{}
 	stopPending    bool
 	stopFinalizing bool
@@ -492,11 +497,21 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 		return fmt.Errorf("failed to update bot status: %w", err)
 	}
 
-	// Traded symbols accumulate for the process lifetime: an earlier run's
-	// orders may still be open, so a new Start never drops them from the
-	// kill switch's drain list.
-	if params != nil && params.Symbol != "" {
-		s.noteTradedSymbol(params.Symbol)
+	// Traded symbols accumulate (and persist across restarts): an earlier
+	// run's orders may still be open, so a new Start never drops them from
+	// the kill switch's drain list. No symbol record, no run.
+	startSymbol := ""
+	if params != nil {
+		startSymbol = params.Symbol
+	}
+	if mode == model.BotModeAuto && params != nil {
+		startSymbol = autoModeSymbol(params.SignalConfig)
+	}
+	if err := s.noteTradedSymbol(ctx, startSymbol); err != nil {
+		if rbErr := s.botStatusRepo.SetActive(ctx, false); rbErr != nil {
+			logger.Error("Failed to roll back bot status", "error", rbErr)
+		}
+		return fmt.Errorf("failed to record traded symbol: %w", err)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -587,12 +602,8 @@ func (s *BotServiceImpl) startSignalMode(ctx context.Context) {
 
 // startAutoMode must be called with runningMu held.
 func (s *BotServiceImpl) startAutoMode(ctx context.Context) {
-	symbol := s.signalConfig.Symbol
-	if symbol == "" {
-		symbol = "BTCUSDT"
-	}
+	symbol := autoModeSymbol(s.signalConfig)
 	s.symbol = symbol
-	s.noteTradedSymbol(symbol)
 
 	s.broadcaster.BroadcastBotActivity(&model.BotActivity{
 		Timestamp: time.Now(),
@@ -615,10 +626,40 @@ var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time"
 // botStopJoinTimeout bounds how long Stop waits for the loops to exit.
 var botStopJoinTimeout = 30 * time.Second
 
-// noteTradedSymbol records a symbol this run may hold orders on.
-func (s *BotServiceImpl) noteTradedSymbol(symbol string) {
+// autoModeSymbol is the symbol an auto-mode run trades.
+func autoModeSymbol(cfg input.SignalConfig) string {
+	if cfg.Symbol == "" {
+		return "BTCUSDT"
+	}
+	return cfg.Symbol
+}
+
+// tradedSymbolPersistTimeout bounds one durable symbol write. Start makes it
+// while holding runningMu, so a stalled database must not hold that lock (and
+// with it Stop) for long.
+var tradedSymbolPersistTimeout = 3 * time.Second
+
+// noteTradedSymbol records a symbol the bot may hold orders on, durably when
+// the status repository can store it. Callers place no order for the symbol
+// if this fails.
+func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol string) error {
 	if symbol == "" {
-		return
+		return nil
+	}
+	s.tradedMu.Lock()
+	known := s.tradedSymbols[symbol]
+	s.tradedMu.Unlock()
+	if known {
+		return nil
+	}
+	// The write runs without tradedMu so status reads are not stuck behind it.
+	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
+		writeCtx, cancel := context.WithTimeout(ctx, tradedSymbolPersistTimeout)
+		err := store.AddTradedSymbol(writeCtx, symbol)
+		cancel()
+		if err != nil {
+			return err
+		}
 	}
 	s.tradedMu.Lock()
 	defer s.tradedMu.Unlock()
@@ -626,16 +667,113 @@ func (s *BotServiceImpl) noteTradedSymbol(symbol string) {
 		s.tradedSymbols = make(map[string]bool)
 	}
 	s.tradedSymbols[symbol] = true
+	return nil
 }
 
-func (s *BotServiceImpl) tradedSymbolList() []string {
+// tradedSymbolList returns every symbol traded by this process or, when
+// persisted, by an earlier one.
+func (s *BotServiceImpl) tradedSymbolList(ctx context.Context) ([]string, error) {
+	seen := map[string]bool{}
+	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
+		stored, err := store.ListTradedSymbols(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, sym := range stored {
+			seen[sym] = true
+		}
+	}
 	s.tradedMu.Lock()
-	defer s.tradedMu.Unlock()
-	out := make([]string, 0, len(s.tradedSymbols))
 	for sym := range s.tradedSymbols {
+		seen[sym] = true
+	}
+	s.tradedMu.Unlock()
+	out := make([]string, 0, len(seen))
+	for sym := range seen {
 		out = append(out, sym)
 	}
 	sort.Strings(out)
+	return out, nil
+}
+
+// unresolvedOrder is a submission whose outcome no loop will reconcile any
+// more because its run stopped.
+type unresolvedOrder struct {
+	symbol        string
+	clientOrderID string
+	submittedAt   time.Time
+}
+
+// botStopReconcileTimeout bounds the order lookups one Stop makes.
+var botStopReconcileTimeout = 5 * time.Second
+
+// afterStopJoin is a test seam run after Stop has joined the loops.
+var afterStopJoin = func() {}
+
+// parkUnknownOrders hands a stopping loop's unknown submissions to Stop.
+// Confirmed orders are skipped: the exchange lists them as open orders.
+func (s *BotServiceImpl) parkUnknownOrders(symbol string, orders ...*gridPendingOrder) {
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	for _, o := range orders {
+		if o == nil || !o.unknown {
+			continue
+		}
+		if s.unresolved == nil {
+			s.unresolved = make(map[string]unresolvedOrder)
+		}
+		s.unresolved[o.clientOrderID] = unresolvedOrder{symbol: symbol, clientOrderID: o.clientOrderID, submittedAt: o.submittedAt}
+	}
+}
+
+// reconcileUnresolved looks every parked submission up with a context of its
+// own (the run's is cancelled). An order the exchange knows in any state is
+// resolved: an open one is on the book for the kill switch to cancel. One
+// still not found after gridUnknownGrace never reached the exchange.
+func (s *BotServiceImpl) reconcileUnresolved() {
+	s.tradedMu.Lock()
+	orders := make([]unresolvedOrder, 0, len(s.unresolved))
+	for _, o := range s.unresolved {
+		orders = append(orders, o)
+	}
+	s.tradedMu.Unlock()
+	if len(orders) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), botStopReconcileTimeout)
+	defer cancel()
+	for _, o := range orders {
+		report, err := s.lookupFor(o.symbol).lookup(ctx, o.clientOrderID, o.submittedAt)
+		if err != nil {
+			logger.Warn("Unknown order still unresolved after stop", "symbol", o.symbol, "clientOrderId", o.clientOrderID, "error", err)
+			continue
+		}
+		if report.state == gridOrderNotFound && time.Since(o.submittedAt) < gridUnknownGrace {
+			continue
+		}
+		s.tradedMu.Lock()
+		delete(s.unresolved, o.clientOrderID)
+		s.tradedMu.Unlock()
+	}
+}
+
+func (s *BotServiceImpl) lookupFor(symbol string) gridExchange {
+	if s.orderLookup != nil {
+		return s.orderLookup(symbol)
+	}
+	s.runningMu.RLock()
+	defer s.runningMu.RUnlock()
+	return &liveGridExchange{symbol: symbol, manager: s.exchangeManager, client: s.tradingClient}
+}
+
+func (s *BotServiceImpl) unresolvedOrderList() []model.UnresolvedOrder {
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	out := make([]model.UnresolvedOrder, 0, len(s.unresolved))
+	for _, o := range s.unresolved {
+		out = append(out, model.UnresolvedOrder{Symbol: o.symbol, ClientOrderID: o.clientOrderID})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientOrderID < out[j].ClientOrderID })
 	return out
 }
 
@@ -682,6 +820,8 @@ func (s *BotServiceImpl) Stop(ctx context.Context) error {
 		s.stopPending = true
 	case !s.stopPending:
 		s.runningMu.Unlock()
+		// A kill retry: re-check what an earlier stop left unresolved.
+		s.reconcileUnresolved()
 		return input.ErrBotNotRunning
 	}
 	joined := s.runJoined
@@ -693,9 +833,13 @@ func (s *BotServiceImpl) Stop(ctx context.Context) error {
 		logger.Error("Trading loop did not exit after stop", "timeout", botStopJoinTimeout)
 		return ErrBotStopTimeout
 	}
+	afterStopJoin()
+	s.reconcileUnresolved()
 
 	s.runningMu.Lock()
-	finish := s.stopPending && !s.stopFinalizing
+	// Only the run this call joined may be finalized: a later run may have
+	// started and begun stopping while this waiter was paused.
+	finish := s.stopPending && !s.stopFinalizing && s.runJoined == joined
 	s.stopFinalizing = s.stopFinalizing || finish
 	s.runningMu.Unlock()
 	if !finish {
@@ -730,6 +874,14 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	if err != nil {
 		return nil, err
 	}
+	// Fewer symbols than were traded would let the kill switch skip live
+	// orders, so an unreadable list fails the status read.
+	symbols, err := s.tradedSymbolList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read traded symbols: %w", err)
+	}
+	status.Symbols = symbols
+	status.UnresolvedOrders = s.unresolvedOrderList()
 
 	s.runningMu.RLock()
 	status.IsActive = s.isRunning
@@ -737,7 +889,6 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.TotalTrades = s.botStatus.TotalTrades
 	status.TotalProfit = s.botStatus.TotalProfit
 	status.BotMode = s.botMode
-	status.Symbols = s.tradedSymbolList()
 	if s.isRunning {
 		status.Symbol = s.symbol
 		startedAt := s.startedAt
@@ -764,6 +915,7 @@ func (s *BotServiceImpl) listenForOrderSignals(ctx context.Context, cfg input.Si
 		return
 	}
 	orders := newSignalOrderBook()
+	defer s.parkSignalOrders(orders)
 
 	for {
 		select {
@@ -801,6 +953,13 @@ func (s *BotServiceImpl) listenForOrderSignals(ctx context.Context, cfg input.Si
 	}
 }
 
+// parkSignalOrders hands a stopping signal/auto loop's unknown orders to Stop.
+func (s *BotServiceImpl) parkSignalOrders(orders *signalOrderBook) {
+	for symbol, o := range orders.pending {
+		s.parkUnknownOrders(symbol, o)
+	}
+}
+
 // autoTradingLoop combines signal-based entry with auto-adjust stop-loss/take-profit
 func (s *BotServiceImpl) autoTradingLoop(ctx context.Context, cfg input.SignalConfig) {
 	signalChan, err := s.orderSignalSub.SubscribeOrderSignals(ctx)
@@ -809,6 +968,7 @@ func (s *BotServiceImpl) autoTradingLoop(ctx context.Context, cfg input.SignalCo
 		return
 	}
 	orders := newSignalOrderBook()
+	defer s.parkSignalOrders(orders)
 
 	// Price check ticker for stop-loss/take-profit monitoring
 	priceTicker := time.NewTicker(10 * time.Second)
@@ -979,7 +1139,10 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
-	s.noteTradedSymbol(symbol)
+	if err := s.noteTradedSymbol(ctx, symbol); err != nil {
+		logger.Error("Signal trade skipped: traded symbol not recorded", "symbol", symbol, "error", err)
+		return false
+	}
 	// Determine quantity from risk config
 	quantity := cfg.Quantity
 	if quantity <= 0 {
@@ -1018,6 +1181,7 @@ func (s *BotServiceImpl) gridTradingLoop(ctx context.Context, grid gridParams) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	book := newGridBook(grid)
+	defer func() { s.parkUnknownOrders(grid.symbol, book.pending) }()
 
 	for {
 		select {
@@ -1164,7 +1328,10 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
-	s.noteTradedSymbol(grid.symbol)
+	if err := s.noteTradedSymbol(ctx, grid.symbol); err != nil {
+		logger.Error("Grid tick skipped: traded symbol not recorded", "symbol", grid.symbol, "error", err)
+		return
+	}
 	s.runningMu.RLock()
 	running := s.isRunning
 	client := s.tradingClient

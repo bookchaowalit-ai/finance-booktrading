@@ -38,6 +38,14 @@ type BotStatusRepository interface {
 	UpdateProfit(ctx context.Context, profit float64) error
 }
 
+// TradedSymbolStore persists every symbol the bot has traded, so the kill
+// switch still drains their open orders after a backend restart. A bot status
+// repository may implement it.
+type TradedSymbolStore interface {
+	AddTradedSymbol(ctx context.Context, symbol string) error
+	ListTradedSymbols(ctx context.Context) ([]string, error)
+}
+
 // MarketDataRepository defines the interface for market data caching
 type MarketDataRepository interface {
 	GetLatest(ctx context.Context, symbol model.TradeSymbol) (*model.MarketData, error)

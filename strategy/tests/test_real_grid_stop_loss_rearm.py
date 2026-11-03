@@ -176,7 +176,7 @@ def test_partial_sell_fill_shrinks_lot_instead_of_closing():
     state.lot_qty = {BUY: 1.0}
     state.stop_loss_orders = {}
     state.stop_loss_triggered = {}
-    qty = bot._close_lot_for_sell(cfg, state, 102_000.0, executed_qty=0.4)
-    assert qty == (BUY, pytest.approx(0.4))
+    pieces, stops = bot._consume_lots(state, 102_000.0, 0.4)
+    assert pieces == [(BUY, pytest.approx(0.4))] and stops == []
     assert state.lot_qty[BUY] == pytest.approx(0.6)
     assert BUY in state.filled_buy_prices
