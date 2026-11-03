@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,4 +133,28 @@ func TestStatusReportsRunningSymbol(t *testing.T) {
 	if err != nil || st.Symbol != "BTCUSDT" {
 		t.Fatalf("got %+v err=%v, want symbol BTCUSDT", st, err)
 	}
+}
+
+// Signal mode can trade any symbol, and a kill retry runs after the bot has
+// stopped: status must list every symbol traded in the last run, even then.
+func TestStatusListsTradedSymbolsAfterStop(t *testing.T) {
+	s := newRunningBot(t)
+	s.noteTradedSymbol("ETHUSDT")
+	s.noteTradedSymbol("BTCUSDT")
+	s.noteTradedSymbol("ETHUSDT")
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.GetStatus(context.Background())
+	if strings.Join(st.Symbols, ",") != "BTCUSDT,ETHUSDT" {
+		t.Fatalf("got %v", st.Symbols)
+	}
+	if err := s.Start(context.Background(), validGrid()); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = s.GetStatus(context.Background())
+	if strings.Join(st.Symbols, ",") != "BTCUSDT" { // validGrid trades BTCUSDT; old run's list is gone
+		t.Fatalf("after Start got %v", st.Symbols)
+	}
+	s.Stop(context.Background())
 }

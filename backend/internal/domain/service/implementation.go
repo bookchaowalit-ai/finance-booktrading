@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -333,6 +334,8 @@ type BotServiceImpl struct {
 	// loops exit; stopPending stays set until a Stop has seen them exit, so a
 	// retried Stop never reports "not running" while a loop is still alive.
 	runLoops       *sync.WaitGroup
+	tradedMu       sync.Mutex
+	tradedSymbols  map[string]bool
 	runJoined      chan struct{}
 	stopPending    bool
 	stopFinalizing bool
@@ -477,6 +480,12 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 		return fmt.Errorf("previous run is still stopping")
 	}
 	s.runLoops = &sync.WaitGroup{}
+	s.tradedMu.Lock()
+	s.tradedSymbols = nil
+	s.tradedMu.Unlock()
+	if params != nil && params.Symbol != "" {
+		s.noteTradedSymbol(params.Symbol)
+	}
 
 	mode := resolveBotMode(params)
 	if mode == model.BotModeGrid {
@@ -582,6 +591,7 @@ func (s *BotServiceImpl) startAutoMode(ctx context.Context) {
 		symbol = "BTCUSDT"
 	}
 	s.symbol = symbol
+	s.noteTradedSymbol(symbol)
 
 	s.broadcaster.BroadcastBotActivity(&model.BotActivity{
 		Timestamp: time.Now(),
@@ -603,6 +613,30 @@ var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time"
 
 // botStopJoinTimeout bounds how long Stop waits for the loops to exit.
 var botStopJoinTimeout = 30 * time.Second
+
+// noteTradedSymbol records a symbol this run may hold orders on.
+func (s *BotServiceImpl) noteTradedSymbol(symbol string) {
+	if symbol == "" {
+		return
+	}
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	if s.tradedSymbols == nil {
+		s.tradedSymbols = make(map[string]bool)
+	}
+	s.tradedSymbols[symbol] = true
+}
+
+func (s *BotServiceImpl) tradedSymbolList() []string {
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
+	out := make([]string, 0, len(s.tradedSymbols))
+	for sym := range s.tradedSymbols {
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // goLoop runs a trading loop of the current run. Callers hold runningMu.
 func (s *BotServiceImpl) goLoop(fn func()) {
@@ -702,6 +736,7 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.TotalTrades = s.botStatus.TotalTrades
 	status.TotalProfit = s.botStatus.TotalProfit
 	status.BotMode = s.botMode
+	status.Symbols = s.tradedSymbolList()
 	if s.isRunning {
 		status.Symbol = s.symbol
 		startedAt := s.startedAt
@@ -943,6 +978,7 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
+	s.noteTradedSymbol(symbol)
 	// Determine quantity from risk config
 	quantity := cfg.Quantity
 	if quantity <= 0 {
@@ -1127,6 +1163,7 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
+	s.noteTradedSymbol(grid.symbol)
 	s.runningMu.RLock()
 	running := s.isRunning
 	client := s.tradingClient
