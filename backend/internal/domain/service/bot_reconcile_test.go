@@ -352,3 +352,24 @@ func TestUnknownTradedExchangeIsReported(t *testing.T) {
 		t.Fatalf("got %v", st.TradedExchanges)
 	}
 }
+
+// After an operator deletes rows, the next order on that symbol must write
+// its row again, or the kill switch would not drain it.
+func TestSymbolRowRewrittenAfterDeletion(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	ctx := context.Background()
+	if err := s.noteTradedSymbol(ctx, "BTCTHB", "binance_th"); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	repo.symbols = nil
+	repo.mu.Unlock()
+	if err := s.noteTradedSymbol(ctx, "BTCTHB", "binance_th"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.GetStatus(ctx)
+	if strings.Join(st.Symbols, ",") != "BTCTHB" {
+		t.Fatalf("row not rewritten: %v", st.Symbols)
+	}
+}

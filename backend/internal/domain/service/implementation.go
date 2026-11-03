@@ -651,14 +651,19 @@ func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol, exchange 
 		return nil
 	}
 	key := model.TradedSymbol{Symbol: symbol, Exchange: exchange}
-	s.tradedMu.Lock()
-	known := s.tradedSymbols[key]
-	s.tradedMu.Unlock()
-	if known {
-		return nil
+	store, hasStore := s.botStatusRepo.(repository.TradedSymbolStore)
+	if !hasStore {
+		s.tradedMu.Lock()
+		known := s.tradedSymbols[key]
+		s.tradedMu.Unlock()
+		if known {
+			return nil
+		}
 	}
+	// With a store every call writes (an idempotent upsert): an operator may
+	// have deleted the row, and the kill switch drains from the store.
 	// The write runs without tradedMu so status reads are not stuck behind it.
-	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
+	if hasStore {
 		writeCtx, cancel := context.WithTimeout(ctx, tradedSymbolPersistTimeout)
 		err := store.AddTradedSymbol(writeCtx, key.Symbol, key.Exchange)
 		cancel()
