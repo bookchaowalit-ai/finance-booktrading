@@ -15,7 +15,7 @@ def _response(status, payload=None):
     return httpx.Response(status, json=payload or {}, request=httpx.Request("GET", "http://backend"))
 
 
-def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol=""):
+def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol="", go_symbols=None, status_ok=True):
     """Bot with a fake backend; returns (bot, posted urls).
 
     ``final_executed`` maps orderId -> executedQty that order-status reports
@@ -50,7 +50,9 @@ def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go
 
     async def get(url, params=None):
         if url.endswith("/api/bot/status"):
-            return _response(200, {"is_active": bool(go_symbol), "symbol": go_symbol})
+            if not status_ok:
+                return _response(502)
+            return _response(200, {"is_active": bool(go_symbol), "symbol": go_symbol, "symbols": go_symbols or []})
         if url.endswith("/api/trade/order-status"):
             oid = int(params["orderId"])
             executed = final_executed.get(oid)
@@ -321,3 +323,83 @@ async def test_go_bot_symbol_is_drained_too(monkeypatch):
     cancelled = [b["orderId"] for u, b in posted if u.endswith("/api/trade/cancel-order")]
     assert cancelled == [31]
     assert result["contained"] is True
+
+
+
+@pytest.mark.asyncio
+async def test_all_go_traded_symbols_are_drained(monkeypatch):
+    bot, posted = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [], "ETHTHB": [], "BTCUSDT": [{"orderId": 31}], "ETHUSDT": [{"orderId": 41}]},
+        go_symbols=["BTCUSDT", "ETHUSDT"],
+    )
+    await bot.kill()
+    cancelled = sorted(b["orderId"] for u, b in posted if u.endswith("/api/trade/cancel-order"))
+    assert cancelled == [31, 41]
+
+
+@pytest.mark.asyncio
+async def test_go_status_failure_is_not_contained(monkeypatch):
+    bot, _ = _bot(monkeypatch, status_ok=False)
+    result = await bot.kill()
+    assert result["contained"] is False
+
+
+@pytest.mark.asyncio
+async def test_kill_retry_still_drains_go_symbols_from_the_first_attempt(monkeypatch):
+    bot, _ = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [], "ETHTHB": [], "BTCUSDT": [{"orderId": 31}]},
+        go_symbols=["BTCUSDT"],
+    )
+    real_post = bot._http.post.side_effect
+
+    async def failing_cancel(url, json=None):
+        if url.endswith("/api/trade/cancel-order"):
+            return _response(502)
+        return await real_post(url, json=json)
+
+    bot._http.post = AsyncMock(side_effect=failing_cancel)
+    assert (await bot.kill())["contained"] is False
+
+    # Retry: Go no longer reports the symbol, the cancel now works.
+    bot2_posted = []
+
+    async def post(url, json=None):
+        bot2_posted.append((url, json))
+        return _response(200)
+
+    bot._http.post = AsyncMock(side_effect=post)
+    orig_get = bot._http.get.side_effect
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"is_active": False, "symbols": []})
+        return await orig_get(url, params=params)
+
+    bot._http.get = AsyncMock(side_effect=get)
+    result = await bot.kill()
+    assert [b["orderId"] for u, b in bot2_posted if u.endswith("/api/trade/cancel-order")] == [31]
+    assert result["contained"] is True
+
+
+@pytest.mark.asyncio
+async def test_unresolved_final_execution_keeps_order_tracked(monkeypatch):
+    bot, _ = _bot(monkeypatch, final_executed={11: 0, 12: None, 21: 0})
+    await bot.kill()
+    assert bot.states["BTCTHB"].active_sells == {2_100_000.0: "12"}, "sync must still resolve it"
+
+
+@pytest.mark.asyncio
+async def test_partial_ordinary_sell_shrinks_its_lot(monkeypatch):
+    bot, _ = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [{"orderId": 12, "side": "SELL", "executedQty": "0.3"}], "ETHTHB": []},
+        final_executed={12: 0.3},
+    )
+    state = bot.states["BTCTHB"]
+    state.filled_buy_prices = {2_000_000.0: 0}
+    state.buy_fill_prices = {2_000_000.0: 1.0}
+    state.lot_qty = {2_000_000.0: 1.0}
+    await bot.kill()
+    assert state.lot_qty[2_000_000.0] == pytest.approx(0.7)

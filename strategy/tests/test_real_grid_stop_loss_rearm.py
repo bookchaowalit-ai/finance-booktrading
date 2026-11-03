@@ -73,6 +73,7 @@ async def test_exchange_confirmed_cancel_while_halted_rearms_stop_loss():
     state.halted = True
     bot._http = object()
     bot._verify_fill = AsyncMock(return_value="cancelled")
+    bot._final_executed_qty = AsyncMock(return_value=0.0)
 
     await bot._reconcile_halted_orders(cfg, state)
 
@@ -85,6 +86,7 @@ async def test_stale_cancel_of_stop_sell_rearms_stop_loss():
     bot, cfg, state = _setup()
     state.order_times["77"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
     bot._cancel_order = AsyncMock(return_value=True)
+    bot._final_executed_qty = AsyncMock(return_value=0.0)
 
     await bot._cancel_stale_orders(cfg, state, STOP)
 
@@ -130,3 +132,40 @@ async def test_partly_filled_stop_sell_rearms_for_the_remaining_quantity():
     await bot._check_stop_loss(cfg, state, 95_000.0)
     bot._place_grid_order.assert_awaited_once()
     assert bot._place_grid_order.await_args.kwargs["quantity"] == pytest.approx(0.6)
+
+
+
+@pytest.mark.asyncio
+async def test_stale_cancel_reads_executed_before_rearming():
+    bot, cfg, state = _setup()
+    state.lot_qty = {BUY: 1.0}
+    state.order_times["77"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    bot._cancel_order = AsyncMock(return_value=True)
+    bot._final_executed_qty = AsyncMock(return_value=0.4)
+    bot._http = object()
+
+    await bot._cancel_stale_orders(cfg, state, STOP)
+
+    assert state.lot_qty[BUY] == pytest.approx(0.6)
+    assert state.stop_loss_triggered[BUY] is False
+
+
+@pytest.mark.asyncio
+async def test_stale_cancel_does_not_rearm_when_executed_unknown():
+    bot, cfg, state = _setup()
+    state.order_times["77"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    bot._cancel_order = AsyncMock(return_value=True)
+    bot._final_executed_qty = AsyncMock(return_value=None)
+    bot._http = object()
+
+    await bot._cancel_stale_orders(cfg, state, STOP)
+    await bot._check_stop_loss(cfg, state, 95_000.0)
+
+    bot._place_grid_order.assert_not_awaited()
+
+
+def test_filled_sell_pnl_uses_the_lot_quantity():
+    bot, cfg, state = _setup()
+    state.lot_qty = {BUY: 0.4}
+    qty = bot._sell_fill_qty(cfg, state, BUY)
+    assert qty == pytest.approx(0.4)
