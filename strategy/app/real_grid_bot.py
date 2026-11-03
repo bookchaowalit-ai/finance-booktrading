@@ -333,6 +333,9 @@ class RealGridBot:
         # (symbol, orderId) cancelled by a kill whose final execution is not
         # known yet; every containment re-checks them.
         self._unresolved_cancels: Dict[tuple, str] = {}  # -> order side
+        # Order POSTs whose outcome is unknown (timeout, 5xx): the order may
+        # still go live, so containment waits them out (UNCERTAIN_GRACE_SEC).
+        self._uncertain_submissions: List[Dict] = []
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -570,6 +573,9 @@ class RealGridBot:
         return await asyncio.shield(self._containment())
 
     INFLIGHT_WAIT_SEC = 30.0
+    # How long an order POST with an unknown outcome can take to show up in
+    # open orders (the Go grid uses the same grace for its own submissions).
+    UNCERTAIN_GRACE_SEC = 60.0
 
     def _rearm_stop_for_cancelled_sell(
         self, state: RealGridState, sell_price: float, executed_qty: float = 0.0
@@ -769,6 +775,7 @@ class RealGridBot:
             "failed": [],
             "partial_fills": [],
             "unreconciled": [],
+            "uncertain": [],
             "inflight_settled": False,
         }
         self._containing = getattr(self, "_containing", 0) + 1
@@ -799,6 +806,13 @@ class RealGridBot:
                 for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
                     if sym:
                         go_symbols.add(sym.upper())
+                # Go submissions with an unknown outcome may go live after
+                # the drain; Go keeps them listed until the exchange answers.
+                for order in status.get("unresolved_orders") or []:
+                    logger.error("Kill: Go order %s outcome unknown", order)
+                    result["failed"].append({"symbol": order.get("symbol"), "orderId": None, "reason": "go_unresolved"})
+                    if order.get("symbol"):
+                        go_symbols.add(order["symbol"].upper())
             except Exception as e:
                 logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
                 result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
@@ -821,6 +835,7 @@ class RealGridBot:
                 symbols += sorted(sym for sym in go_symbols if sym not in symbols)
 
                 for symbol in symbols:
+                    listed_at = time.time()
                     try:
                         resp = await client.get(
                             f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": symbol}
@@ -831,6 +846,12 @@ class RealGridBot:
                         logger.error("Kill: open orders for %s unavailable: %s", symbol, e)
                         result["failed"].append({"symbol": symbol, "orderId": None})
                         continue
+                    # An uncertain POST older than the grace period would be
+                    # in this listing if it went live, and is cancelled below.
+                    self._uncertain_submissions = [
+                        u for u in self._uncertain_submissions
+                        if u["symbol"] != symbol or u["at"] > listed_at - self.UNCERTAIN_GRACE_SEC
+                    ]
                     state = self.states.get(symbol)
                     for order in orders:
                         order_id = order.get("orderId")
@@ -841,6 +862,7 @@ class RealGridBot:
                         await self._book_kill_cancel(client, result, symbol, str(order_id), order.get("side", ""))
                     if state:
                         await self._save_state(symbol)
+            result["uncertain"] = [dict(u) for u in self._uncertain_submissions]
         finally:
             self._containing -= 1
             if client is not self._http:
@@ -851,6 +873,7 @@ class RealGridBot:
             and result["inflight_settled"]
             and not result["failed"]
             and not result["unreconciled"]
+            and not result["uncertain"]
         )
         if result["contained"]:
             self._go_drain_symbols = set()
@@ -2474,12 +2497,23 @@ class RealGridBot:
                     )
                 else:
                     logger.info("Order rejected @ %.2f: %s", price, err)
+            elif resp.status_code >= 500:
+                # The backend could not tell whether the exchange took it.
+                self._note_uncertain_submission(cfg.symbol, side, price, f"HTTP {resp.status_code}")
             else:
                 err = resp.json().get("error", "unknown")
                 logger.info("Order rejected @ %.2f (HTTP %d): %s", price, resp.status_code, err)
         except Exception as e:
-            logger.info("Failed to place %s @ %.2f: %s", side, price, e)
+            # The request may have reached the exchange before it failed.
+            self._note_uncertain_submission(cfg.symbol, side, price, str(e))
         return False
+
+    def _note_uncertain_submission(self, symbol: str, side: str, price: float, why: str):
+        logger.error(
+            "[RealGrid %s] %s @ %.2f outcome unknown (%s): it may be live on the exchange",
+            symbol, side, price, why,
+        )
+        self._uncertain_submissions.append({"symbol": symbol, "side": side, "price": price, "at": time.time()})
 
 
     def get_status(self) -> Dict:

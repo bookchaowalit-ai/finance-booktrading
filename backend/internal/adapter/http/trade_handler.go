@@ -95,7 +95,7 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 	result, err := h.manager.PlaceOrder(r.Context(), req.Symbol, req.Side, req.Quantity, req.Price)
 	if err != nil {
 		logger.Error("Real trade order failed", "error", err)
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, placeOrderErrorStatus(err), map[string]string{
 			"error": err.Error(),
 		})
 		return
@@ -319,6 +319,16 @@ func (h *TradeHandler) persistTrade(ctx context.Context, req RealOrderRequest, r
 type CancelOrderRequest struct {
 	Symbol  string `json:"symbol"`
 	OrderID int64  `json:"orderId"`
+}
+
+// placeOrderErrorStatus maps an order error to a status: 502 when the order
+// may have reached the exchange anyway (the caller must not assume it was
+// not placed), 400 when it was rejected.
+func placeOrderErrorStatus(err error) int {
+	if exchange.IsOrderStateUnknown(err) {
+		return http.StatusBadGateway
+	}
+	return http.StatusBadRequest
 }
 
 // GetOpenOrders handles GET /api/trade/open-orders?symbol=BTCTHB

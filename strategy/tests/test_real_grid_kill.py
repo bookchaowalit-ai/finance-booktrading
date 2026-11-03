@@ -1,6 +1,7 @@
 """Kill switch containment: stop the Go loop, cancel exchange orders, explicit reset."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -15,7 +16,7 @@ def _response(status, payload=None):
     return httpx.Response(status, json=payload or {}, request=httpx.Request("GET", "http://backend"))
 
 
-def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol="", go_symbols=None, status_ok=True):
+def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol="", go_symbols=None, status_ok=True, go_unresolved=None):
     """Bot with a fake backend; returns (bot, posted urls).
 
     ``final_executed`` maps orderId -> executedQty that order-status reports
@@ -52,7 +53,10 @@ def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go
         if url.endswith("/api/bot/status"):
             if not status_ok:
                 return _response(502)
-            return _response(200, {"is_active": bool(go_symbol), "symbol": go_symbol, "symbols": go_symbols or []})
+            return _response(200, {
+                "is_active": bool(go_symbol), "symbol": go_symbol, "symbols": go_symbols or [],
+                "unresolved_orders": go_unresolved or [],
+            })
         if url.endswith("/api/trade/order-status"):
             oid = int(params["orderId"])
             executed = final_executed.get(oid)
@@ -462,3 +466,85 @@ async def test_unresolved_cancel_is_rechecked_on_retry(monkeypatch):
     result = await bot.kill()
     assert result["contained"] is True
     assert bot.states["BTCTHB"].active_sells == {}
+
+
+@pytest.mark.asyncio
+async def test_go_unresolved_submission_is_not_contained(monkeypatch):
+    """A Go order whose outcome is unknown may still go live after the drain."""
+    bot, _ = _bot(monkeypatch, go_unresolved=[{"symbol": "BTCTHB", "client_order_id": "grid-x-1"}])
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert {"symbol": "BTCTHB", "orderId": None, "reason": "go_unresolved"} in result["failed"]
+
+
+@pytest.mark.asyncio
+async def test_uncertain_python_submission_blocks_containment_until_grace(monkeypatch):
+    """An order POST with an unknown outcome may surface after the drain lists
+    open orders, so containment waits until a listing taken after the grace
+    period would show it."""
+    bot, _ = _bot(monkeypatch)
+    bot._uncertain_submissions.append({"symbol": "BTCTHB", "side": "BUY", "price": 2_000_000.0, "at": time.time()})
+
+    first = await bot.kill()
+    assert first["contained"] is False
+    assert [u["symbol"] for u in first["uncertain"]] == ["BTCTHB"]
+
+    bot._uncertain_submissions[0]["at"] -= bot.UNCERTAIN_GRACE_SEC + 1
+    retry = await bot.kill()
+    assert retry["contained"] is True
+    assert retry["uncertain"] == []
+    assert bot._uncertain_submissions == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_submission_stays_when_its_listing_fails(monkeypatch):
+    bot, _ = _bot(monkeypatch)
+    bot._uncertain_submissions.append({"symbol": "BTCTHB", "side": "BUY", "price": 1.0, "at": time.time() - 3600})
+    get = bot._http.get.side_effect
+
+    async def failing_btc(url, params=None):
+        if url.endswith("/api/trade/open-orders") and params["symbol"] == "BTCTHB":
+            return _response(502)
+        return await get(url, params=params)
+
+    bot._http.get.side_effect = failing_btc
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert len(bot._uncertain_submissions) == 1
+
+
+def _placing_bot(monkeypatch):
+    monkeypatch.setattr(real_grid_bot, "BINANCE_TH_MAINNET", True)
+    cfg = RealGridConfig(symbol="BTCTHB", order_size=0.0001)
+    bot = RealGridBot(configs=[cfg])
+    state = RealGridState(symbol="BTCTHB", current_order_size=0.0001)
+    bot.states[cfg.symbol] = state
+    bot._risk = MagicMock(check_order_allowed=MagicMock(return_value=(True, "")))
+    bot._can_place_sell = AsyncMock(return_value=True)
+    bot._journal = MagicMock(record_entry=AsyncMock())
+    bot._http = MagicMock()
+    return bot, cfg, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["timeout", 502, 504])
+async def test_order_post_with_unknown_outcome_is_recorded_uncertain(monkeypatch, outcome):
+    bot, cfg, state = _placing_bot(monkeypatch)
+    if outcome == "timeout":
+        bot._http.post = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+    else:
+        bot._http.post = AsyncMock(return_value=_response(outcome, {"error": "order state unknown"}))
+
+    placed = await bot._place_grid_order(cfg, state, "SELL", 2_100_000.0)
+
+    assert placed is False
+    assert [(u["symbol"], u["side"]) for u in bot._uncertain_submissions] == [("BTCTHB", "SELL")]
+    assert bot._inflight_orders == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_order_is_not_uncertain(monkeypatch):
+    bot, cfg, state = _placing_bot(monkeypatch)
+    bot._http.post = AsyncMock(return_value=_response(400, {"error": "insufficient balance"}))
+    await bot._place_grid_order(cfg, state, "SELL", 2_100_000.0)
+    assert bot._uncertain_submissions == []
