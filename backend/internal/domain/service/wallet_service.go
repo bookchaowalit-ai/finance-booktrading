@@ -6,10 +6,12 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
+	"os"
 	"sync"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/hkdf"
 
 	"trading-bot-system/backend/internal/config"
 	"trading-bot-system/backend/internal/logger"
@@ -348,78 +351,140 @@ func (s *WalletService) GetWallets(ctx context.Context, userID string) ([]Wallet
 	return wallets, nil
 }
 
+// DexWalletKeyEnv names the secret (Infisical / compose env) that encrypts
+// dex_wallets.private_key_encrypted. It is separate from ENCRYPTION_KEY so the
+// exchange API keys and the wallet keys can be rotated independently.
+const DexWalletKeyEnv = "DEX_WALLET_ENCRYPTION_KEY"
+
+// ValidateDexWalletKey reports whether DexWalletKeyEnv holds a usable key.
+func ValidateDexWalletKey() error {
+	_, err := dexWalletKey()
+	return err
+}
+
+// dexWalletKey derives the AES-256 key from DexWalletKeyEnv with HKDF-SHA256.
+// There is no fallback: without the secret, wallet keys cannot be sealed or
+// opened.
+func dexWalletKey() ([]byte, error) {
+	raw := os.Getenv(DexWalletKeyEnv)
+	if raw == "" {
+		return nil, fmt.Errorf("%s is not set", DexWalletKeyEnv)
+	}
+	if len(raw) < 32 {
+		return nil, fmt.Errorf("%s must be at least 32 characters", DexWalletKeyEnv)
+	}
+	key := make([]byte, 32)
+	h := hkdf.New(sha256.New, []byte(raw), []byte("trading-bot-dex-wallet-encryption"), nil)
+	if _, err := io.ReadFull(h, key); err != nil {
+		return nil, fmt.Errorf("derive wallet key: %w", err)
+	}
+	return key, nil
+}
+
+// legacyDexWalletKey is the constant that was hard-coded here before
+// 2026-11-03. It is public in git history, so it only exists to move old
+// rows to the env key (ReencryptLegacyWalletCiphertext); it never opens
+// wallets for signing.
+func legacyDexWalletKey() []byte {
+	return []byte("dex-wallet-encryption-key-32bytes!"[:32])
+}
+
+// ReencryptLegacyWalletCiphertext opens a ciphertext sealed with the legacy
+// source key and seals it again with the env key. It fails if the input does
+// not open with the legacy key, so it is safe to run over every row.
+func ReencryptLegacyWalletCiphertext(encryptedHex string) (string, error) {
+	key, err := dexWalletKey()
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := openWalletCiphertext(legacyDexWalletKey(), encryptedHex)
+	if err != nil {
+		return "", fmt.Errorf("not a legacy ciphertext: %w", err)
+	}
+	return sealWalletCiphertext(key, plaintext)
+}
+
+// OpensWithDexWalletKey reports whether a ciphertext opens with the env key.
+func OpensWithDexWalletKey(encryptedHex string) bool {
+	key, err := dexWalletKey()
+	if err != nil {
+		return false
+	}
+	_, err = openWalletCiphertext(key, encryptedHex)
+	return err == nil
+}
+
 // encryptPrivateKey encrypts a private key using AES-GCM
 func (s *WalletService) encryptPrivateKey(privateKey *ecdsa.PrivateKey) (string, error) {
-	keyBytes := crypto.FromECDSA(privateKey)
-
-	// Generate encryption key from config (in production, use proper KMS)
-	encryptionKey := s.getEncryptionKey()
-	block, err := aes.NewCipher(encryptionKey)
+	key, err := dexWalletKey()
 	if err != nil {
-		return "", fmt.Errorf("failed to create cipher: %w", err)
+		return "", err
 	}
-
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	nonce := make([]byte, aesGCM.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	// Seal encrypts and authenticates the plaintext
-	ciphertext := aesGCM.Seal(nonce, nonce, keyBytes, nil)
-	return hex.EncodeToString(ciphertext), nil
+	return sealWalletCiphertext(key, crypto.FromECDSA(privateKey))
 }
 
 // decryptPrivateKey decrypts a private key using AES-GCM
 func (s *WalletService) decryptPrivateKey(encryptedHex string) (*ecdsa.PrivateKey, error) {
+	key, err := dexWalletKey()
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := openWalletCiphertext(key, encryptedHex)
+	if err != nil {
+		return nil, err
+	}
+	privateKey, err := crypto.ToECDSA(plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key: %w", err)
+	}
+	return privateKey, nil
+}
+
+// sealWalletCiphertext returns hex(nonce || AES-256-GCM ciphertext).
+func sealWalletCiphertext(key, plaintext []byte) (string, error) {
+	aesGCM, err := newWalletGCM(key)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	return hex.EncodeToString(aesGCM.Seal(nonce, nonce, plaintext, nil)), nil
+}
+
+// openWalletCiphertext reverses sealWalletCiphertext.
+func openWalletCiphertext(key []byte, encryptedHex string) ([]byte, error) {
 	encryptedBytes, err := hex.DecodeString(encryptedHex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode encrypted key: %w", err)
 	}
-
-	encryptionKey := s.getEncryptionKey()
-	block, err := aes.NewCipher(encryptionKey)
+	aesGCM, err := newWalletGCM(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+		return nil, err
 	}
-
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
 	nonceSize := aesGCM.NonceSize()
 	if len(encryptedBytes) < nonceSize {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
-
 	nonce, ciphertext := encryptedBytes[:nonceSize], encryptedBytes[nonceSize:]
 	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt: %w", err)
 	}
-
-	privateKey, err := crypto.ToECDSA(plaintext)
-	if err != nil {
-		return nil, fmt.Errorf("invalid private key: %w", err)
-	}
-
-	return privateKey, nil
+	return plaintext, nil
 }
 
-// getEncryptionKey derives an encryption key from environment (simplified - use KMS in production)
-func (s *WalletService) getEncryptionKey() []byte {
-	// In production, use a proper KMS or key derivation
-	// For now, use a fixed 32-byte key from environment
-	key := "dex-wallet-encryption-key-32bytes!"
-	if len(key) < 32 {
-		key = key + "!!!!!!!fill32bytes"
+func newWalletGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
-	return []byte(key[:32])
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+	return aesGCM, nil
 }
 
 // getChainName returns the name of the configured default chain

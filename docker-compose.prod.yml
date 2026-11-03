@@ -92,6 +92,8 @@ services:
       - DATABASE_SSLMODE=disable
       # Security
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required (32+ chars)}
+      # Seals dex_wallets private keys; required (32+ chars) when DEX_ENABLED=true.
+      - DEX_WALLET_ENCRYPTION_KEY=${DEX_WALLET_ENCRYPTION_KEY:-}
       - FRONTEND_URL=${FRONTEND_URL:-https://your-domain.com}
       # Strategy proxy (/strategy-api/*): backend validates the user session and
       # forwards with AUTH_TOKEN; the browser never sees the service token.

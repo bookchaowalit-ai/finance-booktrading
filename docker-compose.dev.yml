@@ -56,6 +56,8 @@ services:
       - DATABASE_NAME=trading_bot
       - DATABASE_SSLMODE=disable
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-change_me_in_production_32chars}
+      # Seals dex_wallets private keys; required (32+ chars) when DEX_ENABLED=true.
+      - DEX_WALLET_ENCRYPTION_KEY=${DEX_WALLET_ENCRYPTION_KEY:-}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3001}
       - STRATEGY_URL=http://strategy:8000
       - AUTH_TOKEN=${AUTH_TOKEN:-}
