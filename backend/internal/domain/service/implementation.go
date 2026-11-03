@@ -507,7 +507,7 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	if mode == model.BotModeAuto && params != nil {
 		startSymbol = autoModeSymbol(params.SignalConfig)
 	}
-	if err := s.noteTradedSymbol(startSymbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, startSymbol); err != nil {
 		if rbErr := s.botStatusRepo.SetActive(ctx, false); rbErr != nil {
 			logger.Error("Failed to roll back bot status", "error", rbErr)
 		}
@@ -634,23 +634,35 @@ func autoModeSymbol(cfg input.SignalConfig) string {
 	return cfg.Symbol
 }
 
+// tradedSymbolPersistTimeout bounds one durable symbol write. Start makes it
+// while holding runningMu, so a stalled database must not hold that lock (and
+// with it Stop) for long.
+var tradedSymbolPersistTimeout = 3 * time.Second
+
 // noteTradedSymbol records a symbol the bot may hold orders on, durably when
 // the status repository can store it. Callers place no order for the symbol
 // if this fails.
-func (s *BotServiceImpl) noteTradedSymbol(symbol string) error {
+func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol string) error {
 	if symbol == "" {
 		return nil
 	}
 	s.tradedMu.Lock()
-	defer s.tradedMu.Unlock()
-	if s.tradedSymbols[symbol] {
+	known := s.tradedSymbols[symbol]
+	s.tradedMu.Unlock()
+	if known {
 		return nil
 	}
+	// The write runs without tradedMu so status reads are not stuck behind it.
 	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
-		if err := store.AddTradedSymbol(context.Background(), symbol); err != nil {
+		writeCtx, cancel := context.WithTimeout(ctx, tradedSymbolPersistTimeout)
+		err := store.AddTradedSymbol(writeCtx, symbol)
+		cancel()
+		if err != nil {
 			return err
 		}
 	}
+	s.tradedMu.Lock()
+	defer s.tradedMu.Unlock()
 	if s.tradedSymbols == nil {
 		s.tradedSymbols = make(map[string]bool)
 	}
@@ -1127,7 +1139,7 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
-	if err := s.noteTradedSymbol(symbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, symbol); err != nil {
 		logger.Error("Signal trade skipped: traded symbol not recorded", "symbol", symbol, "error", err)
 		return false
 	}
@@ -1316,7 +1328,7 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
-	if err := s.noteTradedSymbol(grid.symbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, grid.symbol); err != nil {
 		logger.Error("Grid tick skipped: traded symbol not recorded", "symbol", grid.symbol, "error", err)
 		return
 	}

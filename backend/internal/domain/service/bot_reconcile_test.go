@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"trading-bot-system/backend/internal/port/input"
 )
 
 // symbolStoreRepo is a bot status repo that also persists traded symbols,
@@ -51,7 +53,7 @@ func (r *symbolStoreRepo) ListTradedSymbols(ctx context.Context) ([]string, erro
 func TestTradedSymbolsSurviveBackendRestart(t *testing.T) {
 	repo := &symbolStoreRepo{}
 	first := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
-	if err := first.noteTradedSymbol("XRPTHB"); err != nil {
+	if err := first.noteTradedSymbol(context.Background(), "XRPTHB"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -250,5 +252,36 @@ func TestStaleStopWaiterDoesNotFinalizeNextRun(t *testing.T) {
 	close(releaseB)
 	if err := <-stopB; err != nil {
 		t.Fatalf("stop B: %v", err)
+	}
+}
+
+// stallingStore never answers a write until its context ends.
+type stallingStore struct{ symbolStoreRepo }
+
+func (r *stallingStore) AddTradedSymbol(ctx context.Context, symbol string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A stalled symbol write must not hold runningMu forever: Start gives up
+// within the persistence timeout and Stop stays reachable.
+func TestStalledSymbolPersistenceIsBounded(t *testing.T) {
+	old := tradedSymbolPersistTimeout
+	tradedSymbolPersistTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { tradedSymbolPersistTimeout = old })
+
+	s := NewBotService(&stallingStore{}, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background(), validGrid()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Start must fail when the symbol write times out")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start blocked on a stalled symbol write")
+	}
+	if err := s.Stop(context.Background()); !errors.Is(err, input.ErrBotNotRunning) {
+		t.Fatalf("got %v, want ErrBotNotRunning", err)
 	}
 }

@@ -139,9 +139,9 @@ func TestStatusReportsRunningSymbol(t *testing.T) {
 // stopped: status must list every symbol traded in the last run, even then.
 func TestStatusListsTradedSymbolsAfterStop(t *testing.T) {
 	s := newRunningBot(t)
-	s.noteTradedSymbol("ETHUSDT")
-	s.noteTradedSymbol("BTCUSDT")
-	s.noteTradedSymbol("ETHUSDT")
+	s.noteTradedSymbol(context.Background(), "ETHUSDT")
+	s.noteTradedSymbol(context.Background(), "BTCUSDT")
+	s.noteTradedSymbol(context.Background(), "ETHUSDT")
 	if err := s.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestStatusListsTradedSymbolsAfterStop(t *testing.T) {
 // A Start that fails must not wipe the symbols a kill retry still has to drain.
 func TestFailedStartKeepsPreviousTradedSymbols(t *testing.T) {
 	s := newRunningBot(t)
-	s.noteTradedSymbol("ETHUSDT")
+	s.noteTradedSymbol(context.Background(), "ETHUSDT")
 	if err := s.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
