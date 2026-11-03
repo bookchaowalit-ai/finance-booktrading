@@ -94,6 +94,15 @@ type BotStatus struct {
 	// Symbols lists every symbol any run traded since the backend started,
 	// so a kill (or retry) drains all of them.
 	Symbols []string `json:"symbols,omitempty"`
+	// UnresolvedOrders are submissions whose outcome the exchange has not
+	// confirmed yet; while any is listed the kill switch is not contained.
+	UnresolvedOrders []UnresolvedOrder `json:"unresolved_orders,omitempty"`
+}
+
+// UnresolvedOrder is an order submission with an unknown outcome.
+type UnresolvedOrder struct {
+	Symbol        string `json:"symbol"`
+	ClientOrderID string `json:"client_order_id"`
 }
 
 // OrderRequest represents an incoming order request
