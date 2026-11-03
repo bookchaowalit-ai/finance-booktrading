@@ -328,12 +328,16 @@ type BotServiceImpl struct {
 	exchangeManager *exchange.ExchangeManager // pointer so nil comparison works
 	isRunning       bool
 	runningMu       sync.RWMutex
-	// loops tracks the trading goroutines of the current run; Stop waits for
-	// them so no order submission is still in flight when it returns.
-	loops     sync.WaitGroup
-	startedAt time.Time
-	ctx       context.Context
-	cancel    context.CancelFunc
+	// runLoops tracks the trading goroutines of the current run (a fresh
+	// WaitGroup per Start). Stop waits on runJoined, closed once that run's
+	// loops exit; stopPending stays set until a Stop has seen them exit, so a
+	// retried Stop never reports "not running" while a loop is still alive.
+	runLoops    *sync.WaitGroup
+	runJoined   chan struct{}
+	stopPending bool
+	startedAt   time.Time
+	ctx         context.Context
+	cancel      context.CancelFunc
 	// Grid trading fields
 	symbol      string
 	quantity    float64
@@ -468,6 +472,10 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	if s.isRunning {
 		return fmt.Errorf("bot is already running")
 	}
+	if s.stopPending {
+		return fmt.Errorf("previous run is still stopping")
+	}
+	s.runLoops = &sync.WaitGroup{}
 
 	mode := resolveBotMode(params)
 	if mode == model.BotModeGrid {
@@ -595,11 +603,15 @@ var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time"
 // botStopJoinTimeout bounds how long Stop waits for the loops to exit.
 var botStopJoinTimeout = 30 * time.Second
 
-// goLoop runs a trading loop that Stop waits for.
+// goLoop runs a trading loop of the current run. Callers hold runningMu.
 func (s *BotServiceImpl) goLoop(fn func()) {
-	s.loops.Add(1)
+	if s.runLoops == nil {
+		s.runLoops = &sync.WaitGroup{}
+	}
+	wg := s.runLoops
+	wg.Add(1)
 	go func() {
-		defer s.loops.Done()
+		defer wg.Done()
 		fn()
 	}()
 }
@@ -608,34 +620,50 @@ func (s *BotServiceImpl) goLoop(fn func()) {
 // runningMu, so the wait happens after the lock is released.
 func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.runningMu.Lock()
-	if !s.isRunning {
+	switch {
+	case s.isRunning:
+		s.cancel()
+		s.isRunning = false
+		// Reset grid trading state
+		s.symbol = ""
+		s.quantity = 0
+		s.gridLevels = 0
+		s.lowerPrice = 0
+		s.upperPrice = 0
+		s.investment = 0
+		s.signalConfig = input.SignalConfig{}
+		s.positions = make(map[string]*positionInfo)
+
+		wg := s.runLoops
+		joined := make(chan struct{})
+		go func() {
+			if wg != nil {
+				wg.Wait()
+			}
+			close(joined)
+		}()
+		s.runJoined = joined
+		s.stopPending = true
+	case !s.stopPending:
 		s.runningMu.Unlock()
 		return input.ErrBotNotRunning
 	}
-
-	s.cancel()
-	s.isRunning = false
-	// Reset grid trading state
-	s.symbol = ""
-	s.quantity = 0
-	s.gridLevels = 0
-	s.lowerPrice = 0
-	s.upperPrice = 0
-	s.investment = 0
-	s.signalConfig = input.SignalConfig{}
-	s.positions = make(map[string]*positionInfo)
+	joined := s.runJoined
 	s.runningMu.Unlock()
 
-	joined := make(chan struct{})
-	go func() {
-		s.loops.Wait()
-		close(joined)
-	}()
 	select {
 	case <-joined:
 	case <-time.After(botStopJoinTimeout):
 		logger.Error("Trading loop did not exit after stop", "timeout", botStopJoinTimeout)
 		return ErrBotStopTimeout
+	}
+
+	s.runningMu.Lock()
+	finish := s.stopPending
+	s.stopPending = false
+	s.runningMu.Unlock()
+	if !finish {
+		return nil // a concurrent Stop completed it
 	}
 
 	if err := s.botStatusRepo.SetActive(ctx, false); err != nil {

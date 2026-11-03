@@ -59,3 +59,33 @@ func TestStopFailsWhenLoopDoesNotExit(t *testing.T) {
 		t.Fatalf("got %v, want ErrBotStopTimeout", err)
 	}
 }
+
+// After a timed-out Stop, a retry must not answer "not running" (which the
+// kill switch treats as stopped) while the old loop is still alive.
+func TestRetriedStopAfterTimeoutStillReportsTimeout(t *testing.T) {
+	old := botStopJoinTimeout
+	botStopJoinTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { botStopJoinTimeout = old })
+
+	s := newRunningBot(t)
+	release := make(chan struct{})
+	s.goLoop(func() { <-release })
+
+	if err := s.Stop(context.Background()); !errors.Is(err, ErrBotStopTimeout) {
+		t.Fatalf("first stop: got %v", err)
+	}
+	if err := s.Stop(context.Background()); !errors.Is(err, ErrBotStopTimeout) {
+		t.Fatalf("retried stop while loop alive: got %v, want ErrBotStopTimeout", err)
+	}
+	if err := s.Start(context.Background(), validGrid()); err == nil {
+		t.Fatal("Start must be refused while the previous run is still stopping")
+	}
+
+	close(release)
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("stop after the loop exited must complete the stop: %v", err)
+	}
+	if err := s.Stop(context.Background()); !errors.Is(err, input.ErrBotNotRunning) {
+		t.Fatalf("once stopped: got %v, want ErrBotNotRunning", err)
+	}
+}
