@@ -323,6 +323,9 @@ class RealGridBot:
         self._running = False
         self._http: Optional[httpx.AsyncClient] = None
         self._enabled = True  # master kill switch
+        # Order placements between their first await and the POST; contain()
+        # waits for these so nothing lands on the exchange after the drain.
+        self._inflight_orders = 0
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -542,6 +545,17 @@ class RealGridBot:
         logger.warning("Real Grid Bot KILLED — all trading halted")
         return await self.contain()
 
+    INFLIGHT_WAIT_SEC = 30.0
+
+    async def _wait_inflight_orders(self) -> bool:
+        """Wait until no order placement is mid-flight. False on timeout."""
+        deadline = time.monotonic() + self.INFLIGHT_WAIT_SEC
+        while getattr(self, "_inflight_orders", 0) > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
+
     async def contain(self) -> Dict:
         """Stop the Go grid loop, then cancel every open exchange order.
 
@@ -551,8 +565,13 @@ class RealGridBot:
         only when the Go loop is confirmed stopped and no cancel failed.
         """
         client = self._http or httpx.AsyncClient(timeout=15.0, event_hooks=backend_event_hooks())
-        result: Dict = {"go_bot_stopped": False, "cancelled": 0, "failed": []}
+        result: Dict = {"go_bot_stopped": False, "cancelled": 0, "failed": [], "inflight_settled": False}
         try:
+            # Placements already past their _enabled check finish (or bail at
+            # the pre-submit recheck) before the drain lists open orders.
+            result["inflight_settled"] = await self._wait_inflight_orders()
+            if not result["inflight_settled"]:
+                logger.error("Kill: order placement still in flight after %.0fs", self.INFLIGHT_WAIT_SEC)
             try:
                 resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
                 # 409 = no Go bot loop running, which is what we want.
@@ -592,7 +611,9 @@ class RealGridBot:
             if client is not self._http:
                 await client.aclose()
 
-        result["contained"] = result["go_bot_stopped"] and not result["failed"]
+        result["contained"] = (
+            result["go_bot_stopped"] and result["inflight_settled"] and not result["failed"]
+        )
         log = logger.warning if result["contained"] else logger.error
         log("Kill containment: %s", result)
         return result
@@ -1727,12 +1748,14 @@ class RealGridBot:
                 if placed_price is None:
                     continue  # legacy state from before chase tracking existed
                 if placed_price not in state.active_sells:
-                    # Order left the book (filled or cancelled) — fill detection
-                    # handles the accounting; stop tracking it here
+                    # Order left the book. A fill would have closed this lot
+                    # (_match_buy_for_sell drops it from filled_buy_prices), so
+                    # the lot is still open: the sell was cancelled (kill
+                    # containment, manual cancel). Re-arm and re-evaluate now.
                     state.stop_loss_orders.pop(buy_price, None)
-                    continue
+                    state.stop_loss_triggered[buy_price] = False
                 # Chase: price fell well below our resting limit — it won't fill
-                if price < placed_price * (1 - self.STOP_LOSS_CHASE_PCT / 100.0):
+                elif price < placed_price * (1 - self.STOP_LOSS_CHASE_PCT / 100.0):
                     old_oid = state.active_sells.get(placed_price)
                     logger.warning(
                         "[RealGrid %s] STOP-LOSS chase: limit@%d unfilled, price now %d — re-placing",
@@ -2074,6 +2097,13 @@ class RealGridBot:
             )
             return False
 
+        self._inflight_orders = getattr(self, "_inflight_orders", 0) + 1
+        try:
+            return await self._place_grid_order_inner(cfg, state, side, price)
+        finally:
+            self._inflight_orders -= 1
+
+    async def _place_grid_order_inner(self, cfg: RealGridConfig, state: RealGridState, side: str, price: float) -> bool:
         # Use dynamic order size from auto-compounding if available, else base config size
         order_size = state.current_order_size if state.current_order_size > 0 else cfg.order_size
 
@@ -2135,6 +2165,12 @@ class RealGridBot:
         )
         if not allowed:
             logger.info("[RealGrid %s] Order blocked by risk: %s", cfg.symbol, reason)
+            return False
+
+        # A kill may have landed while this placement awaited balances or the
+        # risk check; never submit after it.
+        if not self._enabled:
+            logger.warning("[RealGrid %s] %s @ %.2f dropped: bot killed mid-placement", cfg.symbol, side, price)
             return False
 
         try:
