@@ -8,6 +8,7 @@ import (
 
 	"trading-bot-system/backend/internal/adapter/exchange"
 	"trading-bot-system/backend/internal/adapter/exchange/bitkub"
+	"trading-bot-system/backend/internal/config"
 	"trading-bot-system/backend/internal/domain/model"
 	"trading-bot-system/backend/internal/logger"
 )
@@ -339,28 +340,62 @@ func (s *BotServiceImpl) recordGridFill(grid gridParams, book *gridBook, order *
 	s.runningMu.Unlock()
 }
 
-// liveGridExchange adapts the configured exchange to gridExchange.
+// liveGridExchange adapts the configured exchange to gridExchange. record
+// durably notes the (symbol, exchange) an order is about to go to; the kill
+// switch drains by it, so no order is placed without it.
 type liveGridExchange struct {
 	symbol  string
 	manager *exchange.ExchangeManager
 	client  *bitkub.Client
+	record  func(exchange string) error
+}
+
+// providerPlacer is the part of the exchange manager placement needs.
+type providerPlacer interface {
+	GetCurrentProvider() config.ExchangeProvider
+	PlaceOrderWithClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, side string, quantity, price float64, clientOrderID string) (*exchange.OrderReport, error)
+	PlaceOrderOn(ctx context.Context, provider config.ExchangeProvider, symbol, side string, quantity, price float64) (interface{}, error)
+}
+
+func recordExchange(record func(string) error, ex string) error {
+	if record == nil {
+		return nil
+	}
+	if err := record(ex); err != nil {
+		return fmt.Errorf("traded symbol not recorded, order not placed: %w", err)
+	}
+	return nil
+}
+
+// placeOnPinnedProvider reads the provider once, records it, and submits to
+// that provider, so a provider switch in between cannot send the order to an
+// exchange the kill switch does not know about.
+func placeOnPinnedProvider(ctx context.Context, p providerPlacer, record func(string) error, symbol, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+	provider := p.GetCurrentProvider()
+	if err := recordExchange(record, string(provider)); err != nil {
+		return gridOrderReport{}, err
+	}
+	report, err := p.PlaceOrderWithClientIDOn(ctx, provider, symbol, side, quantity, price, clientOrderID)
+	if err == nil {
+		return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty}, nil
+	}
+	if !errors.Is(err, exchange.ErrReconcileUnsupported) {
+		return gridOrderReport{}, err
+	}
+	// No client order IDs on this exchange: a success is taken as a fill
+	// (previous behavior) and an unknown outcome pauses the grid.
+	if _, err := p.PlaceOrderOn(ctx, provider, symbol, side, quantity, price); err != nil {
+		return gridOrderReport{}, err
+	}
+	return gridOrderReport{state: gridOrderFilled, executedQty: quantity}, nil
 }
 
 func (e *liveGridExchange) place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
 	if e.manager != nil {
-		report, err := e.manager.PlaceOrderWithClientID(ctx, e.symbol, side, quantity, price, clientOrderID)
-		if err == nil {
-			return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty}, nil
-		}
-		if !errors.Is(err, exchange.ErrReconcileUnsupported) {
-			return gridOrderReport{}, err
-		}
-		// No client order IDs on this exchange: a success is taken as a fill
-		// (previous behavior) and an unknown outcome pauses the grid.
-		if _, err := e.manager.PlaceOrder(ctx, e.symbol, side, quantity, price); err != nil {
-			return gridOrderReport{}, err
-		}
-		return gridOrderReport{state: gridOrderFilled, executedQty: quantity}, nil
+		return placeOnPinnedProvider(ctx, e.manager, e.record, e.symbol, clientOrderID, side, quantity, price)
+	}
+	if err := recordExchange(e.record, string(config.ExchangeBitkub)); err != nil {
+		return gridOrderReport{}, err
 	}
 	if _, err := e.client.PlaceOrder(e.symbol, side, "MARKET", quantity, price); err != nil {
 		return gridOrderReport{}, err

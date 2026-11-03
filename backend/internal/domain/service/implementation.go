@@ -12,6 +12,7 @@ import (
 
 	"trading-bot-system/backend/internal/adapter/exchange"
 	"trading-bot-system/backend/internal/adapter/exchange/bitkub"
+	"trading-bot-system/backend/internal/config"
 	"trading-bot-system/backend/internal/domain/model"
 	"trading-bot-system/backend/internal/domain/repository"
 	"trading-bot-system/backend/internal/logger"
@@ -686,14 +687,22 @@ func (s *BotServiceImpl) exchangeLocked() string {
 	if s.exchangeName != nil {
 		return s.exchangeName()
 	}
-	if s.exchangeManager == nil {
-		return ""
+	if s.exchangeManager != nil {
+		return string(s.exchangeManager.GetCurrentProvider())
 	}
-	return string(s.exchangeManager.GetCurrentProvider())
+	if s.tradingClient != nil {
+		return string(config.ExchangeBitkub) // the direct client is Bitkub
+	}
+	return ""
 }
 
-// tradedSymbolList returns every symbol traded by this process or, when
-// persisted, by an earlier one, and the exchanges they were traded on.
+// unknownExchange marks a traded symbol whose exchange was not recorded.
+const unknownExchange = "unknown"
+
+// tradedSymbolList returns every traded symbol and the exchanges they were
+// traded on. With a store, its rows are the truth (the in-memory cache only
+// holds rows written there, and an operator may delete acknowledged ones);
+// without one, this process's own record.
 func (s *BotServiceImpl) tradedSymbolList(ctx context.Context) ([]string, []string, error) {
 	seen := map[model.TradedSymbol]bool{}
 	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
@@ -704,16 +713,19 @@ func (s *BotServiceImpl) tradedSymbolList(ctx context.Context) ([]string, []stri
 		for _, ts := range stored {
 			seen[ts] = true
 		}
+	} else {
+		s.tradedMu.Lock()
+		for ts := range s.tradedSymbols {
+			seen[ts] = true
+		}
+		s.tradedMu.Unlock()
 	}
-	s.tradedMu.Lock()
-	for ts := range s.tradedSymbols {
-		seen[ts] = true
-	}
-	s.tradedMu.Unlock()
 	symbols, exchanges := map[string]bool{}, map[string]bool{}
 	for ts := range seen {
 		symbols[ts.Symbol] = true
-		if ts.Exchange != "" {
+		if ts.Exchange == "" {
+			exchanges[unknownExchange] = true
+		} else {
 			exchanges[ts.Exchange] = true
 		}
 	}
@@ -787,6 +799,17 @@ func (s *BotServiceImpl) reconcileUnresolved() {
 		s.tradedMu.Lock()
 		delete(s.unresolved, o.clientOrderID)
 		s.tradedMu.Unlock()
+	}
+}
+
+// liveExchange is the exchange view for orders of one symbol; each order
+// records the exchange it goes to just before it is submitted.
+func (s *BotServiceImpl) liveExchange(ctx context.Context, symbol string, manager *exchange.ExchangeManager, client *bitkub.Client) *liveGridExchange {
+	return &liveGridExchange{
+		symbol:  symbol,
+		manager: manager,
+		client:  client,
+		record:  func(ex string) error { return s.noteTradedSymbol(ctx, symbol, ex) },
 	}
 }
 
@@ -1174,10 +1197,6 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
-	if err := s.noteTradedSymbol(ctx, symbol, s.currentExchange()); err != nil {
-		logger.Error("Signal trade skipped: traded symbol not recorded", "symbol", symbol, "error", err)
-		return false
-	}
 	// Determine quantity from risk config
 	quantity := cfg.Quantity
 	if quantity <= 0 {
@@ -1206,7 +1225,7 @@ func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalO
 		return false
 	}
 
-	ex := &liveGridExchange{symbol: symbol, manager: manager, client: client}
+	ex := s.liveExchange(ctx, symbol, manager, client)
 	return s.signalTradeStep(ctx, orders, symbol, side, quantity, currentPrice, ex)
 }
 
@@ -1363,10 +1382,6 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
-	if err := s.noteTradedSymbol(ctx, grid.symbol, s.currentExchange()); err != nil {
-		logger.Error("Grid tick skipped: traded symbol not recorded", "symbol", grid.symbol, "error", err)
-		return
-	}
 	s.runningMu.RLock()
 	running := s.isRunning
 	client := s.tradingClient
@@ -1387,7 +1402,7 @@ func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams
 		return
 	}
 
-	s.gridStep(ctx, grid, book, currentPrice, &liveGridExchange{symbol: grid.symbol, manager: manager, client: client})
+	s.gridStep(ctx, grid, book, currentPrice, s.liveExchange(ctx, grid.symbol, manager, client))
 }
 
 // PortfolioServiceImpl implements the PortfolioService interface

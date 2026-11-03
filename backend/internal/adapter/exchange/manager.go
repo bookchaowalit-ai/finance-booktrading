@@ -303,10 +303,12 @@ func (m *ExchangeManager) GetBalances(ctx context.Context) ([]Balance, error) {
 
 // PlaceOrder places an order on the current exchange
 func (m *ExchangeManager) PlaceOrder(ctx context.Context, symbol string, side string, quantity float64, price float64) (interface{}, error) {
-	m.mu.RLock()
-	provider := m.currentProvider
-	m.mu.RUnlock()
+	return m.PlaceOrderOn(ctx, m.GetCurrentProvider(), symbol, side, quantity, price)
+}
 
+// PlaceOrderOn places an order on the given provider, so a caller can record
+// the provider it trades on before submitting and never race a provider switch.
+func (m *ExchangeManager) PlaceOrderOn(ctx context.Context, provider config.ExchangeProvider, symbol string, side string, quantity float64, price float64) (interface{}, error) {
 	switch provider {
 	case config.ExchangeBinance:
 		return m.placeBinanceOrder(ctx, symbol, side, quantity, price)
@@ -324,11 +326,15 @@ func (m *ExchangeManager) PlaceOrder(ctx context.Context, symbol string, side st
 // (see IsOrderStateUnknown) means the order may exist: look it up with
 // LookupOrderByClientID before placing anything else.
 func (m *ExchangeManager) PlaceOrderWithClientID(ctx context.Context, symbol, side string, quantity, price float64, clientOrderID string) (*OrderReport, error) {
+	return m.PlaceOrderWithClientIDOn(ctx, m.GetCurrentProvider(), symbol, side, quantity, price, clientOrderID)
+}
+
+// PlaceOrderWithClientIDOn is PlaceOrderWithClientID on the given provider.
+func (m *ExchangeManager) PlaceOrderWithClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, side string, quantity, price float64, clientOrderID string) (*OrderReport, error) {
 	if !ValidClientOrderID(clientOrderID) {
 		return nil, fmt.Errorf("invalid client order ID %q", clientOrderID)
 	}
 	m.mu.RLock()
-	provider := m.currentProvider
 	executor := m.binanceExecutor
 	thAdapter := m.binanceTHAdapter
 	bk := m.bitkubClient

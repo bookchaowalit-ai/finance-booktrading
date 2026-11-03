@@ -317,3 +317,38 @@ func TestStatusReportsExchangesSymbolsWereTradedOn(t *testing.T) {
 		t.Fatalf("symbols %v", st.Symbols)
 	}
 }
+
+// The runbook clears an old exchange by deleting its rows; the process's own
+// cache must not bring it back while a store exists.
+func TestDeletedTradedSymbolRowsLeaveTheStatus(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	if err := s.noteTradedSymbol(context.Background(), "BTCUSDT", "binance"); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	repo.symbols = nil
+	repo.mu.Unlock()
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.TradedExchanges) != 0 || len(st.Symbols) != 0 {
+		t.Fatalf("deleted rows still reported: %v %v", st.Symbols, st.TradedExchanges)
+	}
+}
+
+// A row with no exchange (recorded before migration 024, or by a bot with
+// no provider) is not known to be safe: report it as "unknown".
+func TestUnknownTradedExchangeIsReported(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	repo.AddTradedSymbol(context.Background(), "BTCTHB", "")
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(st.TradedExchanges, ",") != "unknown" {
+		t.Fatalf("got %v", st.TradedExchanges)
+	}
+}
