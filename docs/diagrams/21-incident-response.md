@@ -15,6 +15,7 @@ flowchart TD
         C1{"Real money at risk?"}
         C2["Admin POST /strategy-api/api/real-grid/kill"]
         C3["RiskManager already halted: leave halted"]
+        C2b["Go grid bot running? Admin POST /api/bot/stop and /api/trading/stop, confirm stopped"]
         C4["List open orders: GET /api/trade/open-orders per symbol"]
         C5["Cancel each: POST /api/trade/cancel-order, or cancel on exchange UI"]
         C6{"Open orders = 0?"}
@@ -41,8 +42,9 @@ flowchart TD
     C1 -->|"yes"| C2
     C1 -->|"already halted"| C3
     C1 -->|"no"| T1
-    C2 --> C4
-    C3 --> C4
+    C2 --> C2b
+    C3 --> C2b
+    C2b --> C4
     C4 --> C5 --> C6
     C6 -->|"no"| C4
     C6 -->|"yes, contained"| T1
@@ -53,6 +55,8 @@ flowchart TD
     F3 --> P1
     P1 --> P2 --> P3
 ```
+
+หมายเหตุ: kill ของ Python `RealGridBot` ไม่หยุด Go `BotServiceImpl.gridTradingLoop` (`backend/internal/domain/service/implementation.go`) ที่เริ่มผ่าน `/api/bot/start` หรือ `/api/trading/start` — ต้อง stop ฝั่ง Go ก่อน ไม่งั้น order ใหม่อาจถูกวางหลังจาก cancel แล้ว (`backend/internal/adapter/http/handler.go` `/api/bot/stop`, `/api/trading/stop`)
 
 Sources: `strategy/app/webhook_notifier.py` (`send_kill_switch_alert`, `send_fill_alert`, `send_error_alert`), `strategy/app/real_grid_bot.py`, `frontend/src/lib/sentry.ts`, `strategy/scripts/monitor.py`, `infra/scripts/monitor.sh`, `PRODUCTION.md` (Troubleshooting), `strategy/RUNBOOK.md` ("When NOT to Reset Kill Switch"), `docs/EVIDENCE_LOG.md` (2026-07-23 entry: cross-check กับ Binance TH `GET /api/v1/order`, LEFT JOIN `real_trades` ↔ `trade_journal`), `docs/READINESS_CHECKLIST.md`, `.github/workflows/ci-cd.yml`, `RUNBOOK.md` (Owner: "Solo operator, no multi-person on-call").
 
