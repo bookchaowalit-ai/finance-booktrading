@@ -36,6 +36,10 @@ async def test_confirmed_cancel_by_containment_rearms_stop_loss():
     req = httpx.Request("GET", "http://backend")
 
     async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return httpx.Response(200, json={"is_active": False}, request=req)
+        if url.endswith("/api/trade/order-status"):
+            return httpx.Response(200, json={"status": "CANCELED", "executedQty": "0"}, request=req)
         return httpx.Response(200, json={"orders": [{"orderId": 77, "side": "SELL", "executedQty": "0"}]}, request=req)
 
     async def post(url, json=None):
@@ -86,3 +90,43 @@ async def test_stale_cancel_of_stop_sell_rearms_stop_loss():
 
     assert state.active_sells == {}
     assert state.stop_loss_triggered[BUY] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_stale_cancel_keeps_the_order_tracked():
+    bot, cfg, state = _setup()
+    state.order_times["77"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    bot._cancel_order = AsyncMock(return_value=False)
+
+    await bot._cancel_stale_orders(cfg, state, STOP)
+
+    assert state.active_sells == {STOP: "77"}, "an unconfirmed cancel must stay visible to sync"
+    assert state.stop_loss_orders == {BUY: STOP}
+
+
+@pytest.mark.asyncio
+async def test_partly_filled_stop_sell_rearms_for_the_remaining_quantity():
+    bot, cfg, state = _setup()
+    state.lot_qty = {BUY: 1.0}
+    req = httpx.Request("GET", "http://backend")
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return httpx.Response(200, json={"is_active": False}, request=req)
+        if url.endswith("/api/trade/order-status"):
+            return httpx.Response(200, json={"status": "CANCELED", "executedQty": "0.4"}, request=req)
+        return httpx.Response(
+            200, json={"orders": [{"orderId": 77, "side": "SELL", "executedQty": "0.4"}]}, request=req
+        )
+
+    async def post(url, json=None):
+        return httpx.Response(200, json={}, request=req)
+
+    bot._http = MagicMock(get=AsyncMock(side_effect=get), post=AsyncMock(side_effect=post))
+    result = await bot.kill()
+
+    assert result["partial_fills"][0]["orderId"] == 77
+    assert state.lot_qty[BUY] == pytest.approx(0.6)
+    await bot._check_stop_loss(cfg, state, 95_000.0)
+    bot._place_grid_order.assert_awaited_once()
+    assert bot._place_grid_order.await_args.kwargs["quantity"] == pytest.approx(0.6)

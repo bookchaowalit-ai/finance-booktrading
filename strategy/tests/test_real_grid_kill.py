@@ -15,12 +15,18 @@ def _response(status, payload=None):
     return httpx.Response(status, json=payload or {}, request=httpx.Request("GET", "http://backend"))
 
 
-def _bot(monkeypatch, stop_status=200, open_orders=None):
-    """Bot with a fake backend; returns (bot, posted urls)."""
+def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol=""):
+    """Bot with a fake backend; returns (bot, posted urls).
+
+    ``final_executed`` maps orderId -> executedQty that order-status reports
+    after the cancel (default 0 for every listed order; None = lookup fails).
+    """
     open_orders = open_orders if open_orders is not None else {
         "BTCTHB": [{"orderId": 11}, {"orderId": 12}],
         "ETHTHB": [{"orderId": 21}],
     }
+    if final_executed is None:
+        final_executed = {o["orderId"]: 0 for orders in open_orders.values() for o in orders}
     configs = [RealGridConfig(symbol=s) for s in ("BTCTHB", "ETHTHB")]
     bot = RealGridBot(configs=configs)
     bot.states = {
@@ -43,6 +49,14 @@ def _bot(monkeypatch, stop_status=200, open_orders=None):
         return _response(200)
 
     async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"is_active": bool(go_symbol), "symbol": go_symbol})
+        if url.endswith("/api/trade/order-status"):
+            oid = int(params["orderId"])
+            executed = final_executed.get(oid)
+            if executed is None:
+                return _response(502)
+            return _response(200, {"status": "CANCELED", "executedQty": str(executed)})
         return _response(200, {"orders": open_orders.get(params["symbol"], [])})
 
     bot._http = MagicMock(post=AsyncMock(side_effect=post), get=AsyncMock(side_effect=get))
@@ -233,6 +247,7 @@ async def test_partially_filled_buy_becomes_a_protected_lot(monkeypatch):
     bot, _ = _bot(
         monkeypatch,
         open_orders={"BTCTHB": [{"orderId": 11, "side": "BUY", "executedQty": "0.00002"}], "ETHTHB": []},
+        final_executed={11: 0.00002},
     )
     state = bot.states["BTCTHB"]
 
@@ -246,3 +261,63 @@ async def test_partially_filled_buy_becomes_a_protected_lot(monkeypatch):
     # Journal entry stays open: the trade happened, it was not a plain cancel.
     closed = [c.args[0] for c in bot._journal.record_exit.await_args_list]
     assert "11" not in closed
+
+
+@pytest.mark.asyncio
+async def test_overlapping_kills_share_one_containment(monkeypatch):
+    bot, posted = _bot(monkeypatch)
+    gate = asyncio.Event()
+    original_get = bot._http.get
+
+    async def slow_get(url, params=None):
+        await gate.wait()
+        return await original_get(url, params=params)
+
+    bot._http.get = AsyncMock(side_effect=slow_get)
+    first = asyncio.create_task(bot.kill())
+    await asyncio.sleep(0.01)
+    second = asyncio.create_task(bot.kill())
+    await asyncio.sleep(0.01)
+    assert bot.enable() is False
+    gate.set()
+    r1, r2 = await first, await second
+
+    assert r1 == r2
+    stops = [u for u, _ in posted if u.endswith("/api/bot/stop")]
+    assert len(stops) == 1, "one containment for both kill requests"
+    assert bot.enable() is True
+
+
+@pytest.mark.asyncio
+async def test_partial_buy_records_final_executed_quantity(monkeypatch):
+    # Snapshot says 0.00002; it filled further before the cancel landed.
+    bot, _ = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [{"orderId": 11, "side": "BUY", "executedQty": "0.00002"}], "ETHTHB": []},
+        final_executed={11: 0.00003},
+    )
+    result = await bot.kill()
+    state = bot.states["BTCTHB"]
+    assert state.lot_qty[2_000_000.0] == pytest.approx(0.00003)
+    assert result["partial_fills"][0]["executedQty"] == pytest.approx(0.00003)
+
+
+@pytest.mark.asyncio
+async def test_unreconciled_cancel_is_not_contained(monkeypatch):
+    bot, _ = _bot(monkeypatch, final_executed={11: 0, 12: None, 21: 0})
+    result = await bot.kill()
+    assert result["unreconciled"] == [{"symbol": "BTCTHB", "orderId": 12}]
+    assert result["contained"] is False
+
+
+@pytest.mark.asyncio
+async def test_go_bot_symbol_is_drained_too(monkeypatch):
+    bot, posted = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [], "ETHTHB": [], "BTCUSDT": [{"orderId": 31}]},
+        go_symbol="BTCUSDT",
+    )
+    result = await bot.kill()
+    cancelled = [b["orderId"] for u, b in posted if u.endswith("/api/trade/cancel-order")]
+    assert cancelled == [31]
+    assert result["contained"] is True
