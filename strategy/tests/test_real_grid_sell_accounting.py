@@ -263,3 +263,31 @@ async def test_cancelled_partial_grid_sell_resizes_the_live_stop(monkeypatch):
     assert state.active_sells == {}
     assert state.lot_qty[100.0] == pytest.approx(0.6)
     assert state.stop_loss_triggered[100.0] is False
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_superseded_stop_is_not_reimported(monkeypatch):
+    state = _lot_with_live_stop()
+    snapshot = [{"orderId": 7, "status": "NEW", "side": "SELL", "price": "96"}]
+    bot, cfg, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={5: 0.4, 7: 0})
+    bot._verify_fill = AsyncMock(side_effect=lambda symbol, oid: "cancelled" if oid == "5" else "open")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.active_sells == {}
+    assert state.lot_qty[100.0] == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
+async def test_halted_reconcile_survives_a_stop_removed_mid_iteration(monkeypatch):
+    """The partial grid SELL comes first and cancels the stop the loop has
+    not reached yet; reconciliation must still finish and save."""
+    state = _lot_with_live_stop()
+    state.active_sells = {110.0: "5", 96.0: "7"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={5: 0.4, 7: 0})
+    bot._verify_fill = AsyncMock(return_value="cancelled")
+
+    await bot._reconcile_halted_orders(cfg, state)
+
+    assert state.active_sells == {}
+    bot._save_state.assert_awaited()

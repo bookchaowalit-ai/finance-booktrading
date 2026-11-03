@@ -568,3 +568,12 @@ async def test_symbols_traded_on_another_exchange_are_not_contained(monkeypatch)
     result = await bot.kill()
     assert result["contained"] is False
     assert {"symbol": None, "orderId": None, "reason": "other_exchange", "exchange": "binance"} in result["failed"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_exchange_is_not_contained(monkeypatch):
+    """A symbol with no recorded exchange is not known to be drained."""
+    bot, _ = _bot(monkeypatch, exchange="", traded_exchanges=["unknown"])
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert any(f.get("reason") == "other_exchange" for f in result["failed"])
