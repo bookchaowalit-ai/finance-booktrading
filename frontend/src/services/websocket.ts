@@ -41,13 +41,15 @@ export class WebSocketService {
       this.ws.onopen = () => {
         this.ws?.send(JSON.stringify({ type: 'auth', token }));
         console.log('WebSocket connected');
-        this.reconnectAttempts = 0;
       };
 
       this.ws.onmessage = (event) => {
         try {
           const message: WebSocketMessage = JSON.parse(event.data);
           if ((message.type as string) === 'auth_ok') {
+            // Only an accepted session resets backoff; a rejected token keeps
+            // backing off instead of reconnecting every second.
+            this.reconnectAttempts = 0;
             return;
           }
           this.messageHandlers.forEach((handler) => handler(message));

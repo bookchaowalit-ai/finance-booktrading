@@ -21,6 +21,10 @@ class FakeSocket {
     this.readyState = FakeSocket.OPEN;
     this.onopen?.();
   }
+  drop() {
+    this.readyState = 3; // CLOSED
+    this.onclose?.();
+  }
 }
 
 describe('WebSocketService auth', () => {
@@ -63,5 +67,49 @@ describe('WebSocketService auth', () => {
     sock.onmessage?.({ data: JSON.stringify({ type: 'auth_ok' }) });
     expect(handler).not.toHaveBeenCalled();
     svc.disconnect();
+  });
+
+  it('keeps backing off while the server rejects auth', () => {
+    vi.useFakeTimers();
+    try {
+      window.localStorage.setItem('auth_token', 'expired');
+      const svc = new WebSocketService('ws://example.test/ws');
+      svc.connect();
+      const first = FakeSocket.instances[0];
+      first.open();
+      first.drop(); // server closed: auth rejected, no auth_ok
+      vi.advanceTimersByTime(1200);
+      const second = FakeSocket.instances[1];
+      second.open();
+      second.drop();
+      // Attempt counter kept growing: the next retry is ~4 s out, not ~1 s.
+      vi.advanceTimersByTime(1200);
+      expect(FakeSocket.instances).toHaveLength(2);
+      svc.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resets backoff once auth_ok arrives', () => {
+    vi.useFakeTimers();
+    try {
+      window.localStorage.setItem('auth_token', 'sess-123');
+      const svc = new WebSocketService('ws://example.test/ws');
+      svc.connect();
+      const first = FakeSocket.instances[0];
+      first.open();
+      first.drop();
+      vi.advanceTimersByTime(1200);
+      const second = FakeSocket.instances[1];
+      second.open();
+      second.onmessage?.({ data: JSON.stringify({ type: 'auth_ok' }) });
+      second.drop();
+      vi.advanceTimersByTime(1200);
+      expect(FakeSocket.instances).toHaveLength(3);
+      svc.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
