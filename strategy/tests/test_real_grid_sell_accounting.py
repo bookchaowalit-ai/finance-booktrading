@@ -193,3 +193,55 @@ async def test_partial_grid_sell_keeps_stop_when_cancel_fails(monkeypatch):
     assert state.active_sells.get(96.0) == "7"
     assert state.stop_loss_orders[100.0] == 96.0
     bot._place_grid_order.assert_not_awaited()
+
+
+def _journal_exits(bot, order_id):
+    return [c.args for c in bot._journal.record_exit.await_args_list if c.args[0] == order_id]
+
+
+@pytest.mark.asyncio
+async def test_superseded_stop_is_not_reimported_from_the_snapshot(monkeypatch):
+    state = _lot_with_live_stop()
+    snapshot = [{"orderId": 7, "status": "NEW", "side": "SELL", "price": "96"}]
+    bot, cfg, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={5: 0.4, 7: 0.1})
+
+    async def verify(symbol, oid):
+        return "filled" if oid == "5" else "open"
+
+    bot._verify_fill = AsyncMock(side_effect=verify)
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert 96.0 not in state.active_sells
+    # The stop's journal entry is closed once, with its partial-fill loss.
+    (exit_args,) = _journal_exits(bot, "7")
+    assert exit_args[2] == "PARTIAL_SELL_CANCELLED"
+    assert exit_args[3] == pytest.approx(_net(96.0, [(100.0, 0.1)]))
+
+
+@pytest.mark.asyncio
+async def test_stale_partial_sell_journal_closed_once_with_pnl(monkeypatch):
+    """The backend journal only updates OPEN entries: a CANCELLED exit written
+    first would swallow the realized PnL."""
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "9"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={9: 0.3})
+    state.order_times["9"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+
+    await bot._cancel_stale_orders(cfg, state, 105.0)
+
+    (exit_args,) = _journal_exits(bot, "9")
+    assert exit_args[2] == "PARTIAL_SELL_CANCELLED"
+    assert exit_args[3] == pytest.approx(_net(110.0, [(100.0, 0.3)]))
+
+
+@pytest.mark.asyncio
+async def test_unfilled_cancelled_sell_is_journalled_cancelled_once(monkeypatch):
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "9"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={9: 0})
+    state.order_times["9"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+
+    await bot._cancel_stale_orders(cfg, state, 105.0)
+
+    assert _journal_exits(bot, "9") == [("9", 0.0, "CANCELLED", 0.0)]

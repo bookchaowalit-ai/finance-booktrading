@@ -740,27 +740,39 @@ class RealGridBot:
 
     async def _book_cancelled_sell(self, state: RealGridState, sell_price: float, order_id: str, executed_qty: float):
         """Book a confirmed-cancelled SELL: realize what it executed, then
-        re-arm its stop-loss for whatever the lot still holds."""
+        re-arm its stop-loss for whatever the lot still holds.
+
+        This closes the order's journal entry, once and with the outcome: the
+        backend updates only OPEN entries, so cancel paths must not close it
+        first (cancel with close_journal=False).
+        """
         stop_lot = self._stop_lot_for(state, sell_price)
         if executed_qty > 0:
             await self._realize_sell(state, sell_price, executed_qty, order_id, "PARTIAL_SELL_CANCELLED")
+        else:
+            try:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+            except Exception as e:
+                logger.warning("Journal exit (cancel) failed: %s", e)
         if stop_lot is not None and state.stop_loss_orders.get(stop_lot) == sell_price:
             state.stop_loss_orders.pop(stop_lot, None)
             if stop_lot in state.buy_fill_prices:
                 state.stop_loss_triggered[stop_lot] = False
 
-    async def _cancel_superseded_stops(self, symbol: str, state: RealGridState, stop_prices: List[float]):
+    async def _cancel_superseded_stops(self, symbol: str, state: RealGridState, stop_prices: List[float]) -> Set[str]:
         """Cancel resting stop-loss SELLs sized for lots another sell shrank or closed.
 
         The confirmed cancel books any fill it had and re-arms the stop for
         what the lot still holds. A failed cancel leaves the stop live and
         tracked (still triggered), so no second stop is placed beside it.
+        Returns the order IDs it cancelled.
         """
+        cancelled: Set[str] = set()
         for price in stop_prices:
             oid = state.active_sells.get(price)
             if not oid:
                 continue
-            if not await self._cancel_order(symbol, oid):
+            if not await self._cancel_order(symbol, oid, close_journal=False):
                 logger.error(
                     "[RealGrid %s] Stop-loss @ %s (order %s) is sized for a lot another sell shrank; "
                     "cancel failed, it stays live",
@@ -769,7 +781,9 @@ class RealGridBot:
                 continue
             state.active_sells.pop(price, None)
             state.order_times.pop(oid, None)
+            cancelled.add(oid)
             await self._after_confirmed_sell_cancel(symbol, state, price, oid)
+        return cancelled
 
     async def _forget_cancelled_order(self, state: RealGridState, order_id: str, executed_qty: float = 0.0):
         """Drop a confirmed-cancelled order from local state.
@@ -860,12 +874,14 @@ class RealGridBot:
                 "side": side,
                 "executedQty": executed,
             })
-        else:
+        state = self.states.get(symbol)
+        tracked_sell = bool(state and order_id in state.active_sells.values())
+        if executed <= 0 and not tracked_sell:
+            # A tracked SELL's entry is closed by _book_cancelled_sell.
             try:
                 await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
             except Exception as e:
                 logger.warning("Journal exit (kill cancel) failed: %s", e)
-        state = self.states.get(symbol)
         if state:
             await self._forget_cancelled_order(state, order_id, executed)
 
@@ -1382,6 +1398,7 @@ class RealGridBot:
                 state.order_times.pop(oid, None)
 
             # Detect filled SELLs
+            cancelled_this_pass: Set[str] = set()  # superseded stops; the snapshot still lists them
             filled_sell_prices = []
             for price, oid in list(state.active_sells.items()):
                 if oid not in actual_order_ids:
@@ -1400,10 +1417,6 @@ class RealGridBot:
                         "[RealGrid %s] SELL @ %d was cancelled externally (not filled) — no PnL booked",
                         cfg.symbol, sell_price,
                     )
-                    try:
-                        await self._journal.record_exit(oid, 0.0, "CANCELLED", 0.0)
-                    except Exception as e:
-                        logger.warning("Journal exit (external cancel) failed: %s", e)
                     del state.active_sells[sell_price]
                     state.order_times.pop(oid, None)
                     await self._after_confirmed_sell_cancel(cfg.symbol, state, sell_price, oid)
@@ -1450,7 +1463,7 @@ class RealGridBot:
                 )
                 del state.active_sells[sell_price]
                 state.order_times.pop(oid, None)
-                await self._cancel_superseded_stops(cfg.symbol, state, booking["stops"])
+                cancelled_this_pass |= await self._cancel_superseded_stops(cfg.symbol, state, booking["stops"])
 
             # Update fill rate
             if state.orders_placed > 0:
@@ -1470,7 +1483,7 @@ class RealGridBot:
 
                 if status not in ("NEW", "PARTIALLY_FILLED"):
                     continue
-                if price <= 0:
+                if price <= 0 or order_id in cancelled_this_pass:
                     continue
 
                 if side == "BUY" and price not in state.active_buys:
@@ -1511,7 +1524,7 @@ class RealGridBot:
                     price,
                 )
                 journal = getattr(self, "_journal", None)
-                if journal:
+                if journal and side == "BUY":  # a SELL's entry is closed by its booking
                     try:
                         await journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
                     except Exception as exc:
@@ -1543,7 +1556,8 @@ class RealGridBot:
                 drift = price < lower_bound if side == "BUY" else price > upper_bound
                 if not drift and not aged(order_id):
                     continue
-                if not await self._cancel_order(cfg.symbol, order_id):
+                # A SELL's journal entry is closed with its outcome below.
+                if not await self._cancel_order(cfg.symbol, order_id, close_journal=(side == "BUY")):
                     logger.warning(
                         "[RealGrid %s] Cancel of stale %s @ %d not confirmed — keeping it tracked",
                         cfg.symbol, side, price,
@@ -1579,7 +1593,7 @@ class RealGridBot:
                     cfg.symbol, price, price,
                 )
                 continue
-            if await self._cancel_order(cfg.symbol, order_id):
+            if await self._cancel_order(cfg.symbol, order_id, close_journal=False):
                 del state.active_sells[price]
                 await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
                 logger.debug("[RealGrid %s] Cancelled SELL @ %d", cfg.symbol, price)
