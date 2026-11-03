@@ -335,12 +335,15 @@ type BotServiceImpl struct {
 	// retried Stop never reports "not running" while a loop is still alive.
 	runLoops      *sync.WaitGroup
 	tradedMu      sync.Mutex
-	tradedSymbols map[string]bool
+	tradedSymbols map[model.TradedSymbol]bool
 	// unresolved holds submissions a stopped loop left with an unknown
 	// outcome, keyed by client order ID; Stop looks them up (see
 	// reconcileUnresolved). orderLookup builds the exchange view for that.
-	unresolved     map[string]unresolvedOrder
-	orderLookup    func(symbol string) gridExchange
+	unresolved  map[string]unresolvedOrder
+	orderLookup func(symbol string) gridExchange
+	// exchangeName returns the current provider (a test seam; nil = the
+	// exchange manager's).
+	exchangeName   func() string
 	runJoined      chan struct{}
 	stopPending    bool
 	stopFinalizing bool
@@ -507,7 +510,7 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	if mode == model.BotModeAuto && params != nil {
 		startSymbol = autoModeSymbol(params.SignalConfig)
 	}
-	if err := s.noteTradedSymbol(ctx, startSymbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, startSymbol, s.exchangeLocked()); err != nil {
 		if rbErr := s.botStatusRepo.SetActive(ctx, false); rbErr != nil {
 			logger.Error("Failed to roll back bot status", "error", rbErr)
 		}
@@ -642,12 +645,13 @@ var tradedSymbolPersistTimeout = 3 * time.Second
 // noteTradedSymbol records a symbol the bot may hold orders on, durably when
 // the status repository can store it. Callers place no order for the symbol
 // if this fails.
-func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol string) error {
+func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol, exchange string) error {
 	if symbol == "" {
 		return nil
 	}
+	key := model.TradedSymbol{Symbol: symbol, Exchange: exchange}
 	s.tradedMu.Lock()
-	known := s.tradedSymbols[symbol]
+	known := s.tradedSymbols[key]
 	s.tradedMu.Unlock()
 	if known {
 		return nil
@@ -655,7 +659,7 @@ func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol string) er
 	// The write runs without tradedMu so status reads are not stuck behind it.
 	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
 		writeCtx, cancel := context.WithTimeout(ctx, tradedSymbolPersistTimeout)
-		err := store.AddTradedSymbol(writeCtx, symbol)
+		err := store.AddTradedSymbol(writeCtx, key.Symbol, key.Exchange)
 		cancel()
 		if err != nil {
 			return err
@@ -664,36 +668,65 @@ func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol string) er
 	s.tradedMu.Lock()
 	defer s.tradedMu.Unlock()
 	if s.tradedSymbols == nil {
-		s.tradedSymbols = make(map[string]bool)
+		s.tradedSymbols = make(map[model.TradedSymbol]bool)
 	}
-	s.tradedSymbols[symbol] = true
+	s.tradedSymbols[key] = true
 	return nil
 }
 
+// currentExchange names the provider orders go to now ("" when unknown).
+// Callers must not hold runningMu; exchangeLocked is for those that do.
+func (s *BotServiceImpl) currentExchange() string {
+	s.runningMu.RLock()
+	defer s.runningMu.RUnlock()
+	return s.exchangeLocked()
+}
+
+func (s *BotServiceImpl) exchangeLocked() string {
+	if s.exchangeName != nil {
+		return s.exchangeName()
+	}
+	if s.exchangeManager == nil {
+		return ""
+	}
+	return string(s.exchangeManager.GetCurrentProvider())
+}
+
 // tradedSymbolList returns every symbol traded by this process or, when
-// persisted, by an earlier one.
-func (s *BotServiceImpl) tradedSymbolList(ctx context.Context) ([]string, error) {
-	seen := map[string]bool{}
+// persisted, by an earlier one, and the exchanges they were traded on.
+func (s *BotServiceImpl) tradedSymbolList(ctx context.Context) ([]string, []string, error) {
+	seen := map[model.TradedSymbol]bool{}
 	if store, ok := s.botStatusRepo.(repository.TradedSymbolStore); ok {
 		stored, err := store.ListTradedSymbols(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		for _, sym := range stored {
-			seen[sym] = true
+		for _, ts := range stored {
+			seen[ts] = true
 		}
 	}
 	s.tradedMu.Lock()
-	for sym := range s.tradedSymbols {
-		seen[sym] = true
+	for ts := range s.tradedSymbols {
+		seen[ts] = true
 	}
 	s.tradedMu.Unlock()
-	out := make([]string, 0, len(seen))
-	for sym := range seen {
-		out = append(out, sym)
+	symbols, exchanges := map[string]bool{}, map[string]bool{}
+	for ts := range seen {
+		symbols[ts.Symbol] = true
+		if ts.Exchange != "" {
+			exchanges[ts.Exchange] = true
+		}
+	}
+	return sortedKeys(symbols), sortedKeys(exchanges), nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out, nil
+	return out
 }
 
 // unresolvedOrder is a submission whose outcome no loop will reconcile any
@@ -876,11 +909,13 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	}
 	// Fewer symbols than were traded would let the kill switch skip live
 	// orders, so an unreadable list fails the status read.
-	symbols, err := s.tradedSymbolList(ctx)
+	symbols, exchanges, err := s.tradedSymbolList(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read traded symbols: %w", err)
 	}
 	status.Symbols = symbols
+	status.TradedExchanges = exchanges
+	status.Exchange = s.currentExchange()
 	status.UnresolvedOrders = s.unresolvedOrderList()
 
 	s.runningMu.RLock()
@@ -1139,7 +1174,7 @@ func fetchPrice(ctx context.Context, manager *exchange.ExchangeManager, client *
 // executeSignalTrade places one signal-driven order and reports whether an
 // order of this side filled (see signalTradeStep).
 func (s *BotServiceImpl) executeSignalTrade(ctx context.Context, orders *signalOrderBook, symbol string, side string, cfg input.SignalConfig) bool {
-	if err := s.noteTradedSymbol(ctx, symbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, symbol, s.currentExchange()); err != nil {
 		logger.Error("Signal trade skipped: traded symbol not recorded", "symbol", symbol, "error", err)
 		return false
 	}
@@ -1328,7 +1363,7 @@ func (b *gridBook) record(side string, level int, quantity float64) {
 
 // executeGridTrading fetches the price and runs one grid step.
 func (s *BotServiceImpl) executeGridTrading(ctx context.Context, grid gridParams, book *gridBook) {
-	if err := s.noteTradedSymbol(ctx, grid.symbol); err != nil {
+	if err := s.noteTradedSymbol(ctx, grid.symbol, s.currentExchange()); err != nil {
 		logger.Error("Grid tick skipped: traded symbol not recorded", "symbol", grid.symbol, "error", err)
 		return
 	}

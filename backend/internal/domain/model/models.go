@@ -97,6 +97,17 @@ type BotStatus struct {
 	// UnresolvedOrders are submissions whose outcome the exchange has not
 	// confirmed yet; while any is listed the kill switch is not contained.
 	UnresolvedOrders []UnresolvedOrder `json:"unresolved_orders,omitempty"`
+	// Exchange is the current provider; the kill switch can only list and
+	// cancel orders there. TradedExchanges lists every provider a recorded
+	// symbol was traded on, so orders left on another one are not missed.
+	Exchange        string   `json:"exchange,omitempty"`
+	TradedExchanges []string `json:"traded_exchanges,omitempty"`
+}
+
+// TradedSymbol is a symbol the bot traded and the exchange it traded it on.
+type TradedSymbol struct {
+	Symbol   string
+	Exchange string
 }
 
 // UnresolvedOrder is an order submission with an unknown outcome.

@@ -42,8 +42,8 @@ type BotStatusRepository interface {
 // switch still drains their open orders after a backend restart. A bot status
 // repository may implement it.
 type TradedSymbolStore interface {
-	AddTradedSymbol(ctx context.Context, symbol string) error
-	ListTradedSymbols(ctx context.Context) ([]string, error)
+	AddTradedSymbol(ctx context.Context, symbol, exchange string) error
+	ListTradedSymbols(ctx context.Context) ([]model.TradedSymbol, error)
 }
 
 // MarketDataRepository defines the interface for market data caching
