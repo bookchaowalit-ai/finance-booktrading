@@ -327,6 +327,12 @@ class RealGridBot:
         # Order placements between their first await and the POST; contain()
         # waits for these so nothing lands on the exchange after the drain.
         self._inflight_orders = 0
+        # Held by each tick round and by containment, so a drain never runs
+        # while sync / stale cancels are mutating the same state.
+        self._tick_lock = asyncio.Lock()
+        # (symbol, orderId) cancelled by a kill whose final execution is not
+        # known yet; every containment re-checks them.
+        self._unresolved_cancels: Dict[tuple, str] = {}  # -> order side
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -484,8 +490,9 @@ class RealGridBot:
                     await asyncio.sleep(30)
                     continue
 
-                for cfg in self.configs:
-                    await self._tick(cfg)
+                async with self._tick_lock:
+                    for cfg in self.configs:
+                        await self._tick(cfg)
                 await asyncio.sleep(self.configs[0].poll_interval_sec)
             except asyncio.CancelledError:
                 break
@@ -659,6 +666,30 @@ class RealGridBot:
             return
         self._apply_sell_cancel(state, sell_price, executed)
 
+    def _close_lot_for_sell(
+        self, cfg: RealGridConfig, state: RealGridState, sell_price: float, executed_qty: Optional[float]
+    ) -> tuple:
+        """Match a filled SELL to its lot; return (buy_price, quantity sold).
+
+        The quantity is the sell's executed quantity when known, else the
+        lot's recorded size. A sell smaller than its lot leaves the remainder
+        open (same entry time, stop-loss still armed).
+        """
+        lot_sizes = dict(state.lot_qty)
+        fill_times = dict(state.buy_fill_prices)
+        had_stop = dict(state.stop_loss_triggered)
+        buy_price = self._match_buy_for_sell(state, sell_price)
+        base = lot_sizes.get(buy_price) or self._sell_fill_qty(cfg, state, buy_price)
+        qty = executed_qty if executed_qty and executed_qty > 0 else base
+        if buy_price > 0 and qty < base - 1e-12:
+            state.filled_buy_prices[buy_price] = 0
+            state.buy_fill_prices[buy_price] = fill_times.get(buy_price, time.time())
+            state.lot_qty[buy_price] = base - qty
+            if buy_price in had_stop:
+                # The executed stop sell was partial; re-arm for the rest.
+                state.stop_loss_triggered[buy_price] = False
+        return buy_price, qty
+
     def _sell_fill_qty(self, cfg: RealGridConfig, state: RealGridState, buy_price: float) -> float:
         """Quantity a filled SELL closed: the lot's recorded size, else the order size."""
         if buy_price in state.lot_qty:
@@ -689,6 +720,36 @@ class RealGridBot:
             logger.warning("Kill: order-status for %s %s failed: %s", symbol, order_id, e)
         return None
 
+    async def _book_kill_cancel(self, client, result: Dict, symbol: str, order_id: str, side: str):
+        """Book one order containment cancelled, from its final executed quantity.
+
+        Unknown execution keeps the order in local state and in
+        _unresolved_cancels, so sync and the next containment re-check it.
+        """
+        # The open-orders snapshot can be stale: the order may have filled
+        # further before the cancel landed.
+        executed = await self._final_executed_qty(client, symbol, order_id)
+        if executed is None:
+            result["unreconciled"].append({"symbol": symbol, "orderId": int(order_id) if order_id.isdigit() else order_id})
+            self._unresolved_cancels[(symbol, order_id)] = side
+            return
+        if executed > 0:
+            # A real trade: keep its journal entry open.
+            result["partial_fills"].append({
+                "symbol": symbol,
+                "orderId": int(order_id) if order_id.isdigit() else order_id,
+                "side": side,
+                "executedQty": executed,
+            })
+        else:
+            try:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+            except Exception as e:
+                logger.warning("Journal exit (kill cancel) failed: %s", e)
+        state = self.states.get(symbol)
+        if state:
+            self._forget_cancelled_order(state, order_id, executed)
+
     async def contain(self) -> Dict:
         """Stop the Go bot loop, then cancel every open exchange order.
 
@@ -715,77 +776,66 @@ class RealGridBot:
             if not result["inflight_settled"]:
                 logger.error("Kill: order placement still in flight after %.0fs", self.INFLIGHT_WAIT_SEC)
 
-            # Go symbols are remembered until a containment fully succeeds, so
-            # a retry after the Go bot stopped still drains them.
-            go_symbols = getattr(self, "_go_drain_symbols", None)
-            if go_symbols is None:
-                go_symbols = self._go_drain_symbols = set()
-            try:
-                resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
-                if resp.status_code != 200:
-                    raise RuntimeError(f"HTTP {resp.status_code}")
-                status = resp.json()
-                for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
-                    if sym:
-                        go_symbols.add(sym.upper())
-            except Exception as e:
-                logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
-                result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
-            symbols = [cfg.symbol for cfg in self.configs]
-            symbols += sorted(sym for sym in go_symbols if sym not in symbols)
+            async with self._tick_lock:
+                # Cancels from an earlier kill whose execution was unknown:
+                # they are off the book now, so only this re-check finds them.
+                for (symbol, order_id), side in list(self._unresolved_cancels.items()):
+                    del self._unresolved_cancels[(symbol, order_id)]
+                    await self._book_kill_cancel(client, result, symbol, order_id, side)
+                    if (symbol, order_id) not in self._unresolved_cancels and symbol in self.states:
+                        await self._save_state(symbol)
 
-            try:
-                resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
-                # 409 = no Go bot loop running, which is what we want.
-                result["go_bot_stopped"] = resp.status_code in (200, 409)
-                if not result["go_bot_stopped"]:
-                    logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
-            except Exception as e:
-                logger.error("Kill: Go bot stop failed: %s", e)
-
-            for symbol in symbols:
                 try:
-                    resp = await client.get(
-                        f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": symbol}
-                    )
-                    resp.raise_for_status()
-                    orders = resp.json().get("orders") or []
+                    resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
+                    # 409 = no Go bot loop running, which is what we want.
+                    result["go_bot_stopped"] = resp.status_code in (200, 409)
+                    if not result["go_bot_stopped"]:
+                        logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
                 except Exception as e:
-                    logger.error("Kill: open orders for %s unavailable: %s", symbol, e)
-                    result["failed"].append({"symbol": symbol, "orderId": None})
-                    continue
-                state = self.states.get(symbol)
-                for order in orders:
-                    order_id = order.get("orderId")
-                    if not await self._cancel_order(symbol, str(order_id), client=client, close_journal=False):
-                        result["failed"].append({"symbol": symbol, "orderId": order_id})
+                    logger.error("Kill: Go bot stop failed: %s", e)
+
+                # Read after the stop: Go keeps the run's traded symbols after Stop,
+                # and this includes any symbol a signal traded while stopping.
+                # Go symbols are remembered until a containment fully succeeds, so
+                # a retry after the Go bot stopped still drains them.
+                go_symbols = getattr(self, "_go_drain_symbols", None)
+                if go_symbols is None:
+                    go_symbols = self._go_drain_symbols = set()
+                try:
+                    resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                    status = resp.json()
+                    for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
+                        if sym:
+                            go_symbols.add(sym.upper())
+                except Exception as e:
+                    logger.error("Kill: Go bot status unavailable, its symbols may be missed: %s", e)
+                    result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
+                symbols = [cfg.symbol for cfg in self.configs]
+                symbols += sorted(sym for sym in go_symbols if sym not in symbols)
+
+                for symbol in symbols:
+                    try:
+                        resp = await client.get(
+                            f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": symbol}
+                        )
+                        resp.raise_for_status()
+                        orders = resp.json().get("orders") or []
+                    except Exception as e:
+                        logger.error("Kill: open orders for %s unavailable: %s", symbol, e)
+                        result["failed"].append({"symbol": symbol, "orderId": None})
                         continue
-                    result["cancelled"] += 1
-                    # The snapshot can be stale: the order may have filled
-                    # further before the cancel landed.
-                    executed = await self._final_executed_qty(client, symbol, str(order_id))
-                    if executed is None:
-                        # Keep it tracked: the next sync asks the exchange
-                        # what it finally executed.
-                        result["unreconciled"].append({"symbol": symbol, "orderId": order_id})
-                        continue
-                    if executed > 0:
-                        # A real trade: keep its journal entry open.
-                        result["partial_fills"].append({
-                            "symbol": symbol,
-                            "orderId": order_id,
-                            "side": order.get("side", ""),
-                            "executedQty": executed,
-                        })
-                    else:
-                        try:
-                            await self._journal.record_exit(str(order_id), 0.0, "CANCELLED", 0.0)
-                        except Exception as e:
-                            logger.warning("Journal exit (kill cancel) failed: %s", e)
+                    state = self.states.get(symbol)
+                    for order in orders:
+                        order_id = order.get("orderId")
+                        if not await self._cancel_order(symbol, str(order_id), client=client, close_journal=False):
+                            result["failed"].append({"symbol": symbol, "orderId": order_id})
+                            continue
+                        result["cancelled"] += 1
+                        await self._book_kill_cancel(client, result, symbol, str(order_id), order.get("side", ""))
                     if state:
-                        self._forget_cancelled_order(state, str(order_id), executed)
-                if state:
-                    await self._save_state(symbol)
+                        await self._save_state(symbol)
         finally:
             self._containing -= 1
             if client is not self._http:
@@ -1209,11 +1259,10 @@ class RealGridBot:
                         cfg.symbol, sell_price, oid,
                     )
 
-                # Match this sell against the correct open buy lot; it closed
-                # that lot's recorded size (snapshot before the match drops it)
-                lot_sizes = dict(state.lot_qty)
-                actual_buy_price = self._match_buy_for_sell(state, sell_price)
-                qty = lot_sizes.get(actual_buy_price) or self._sell_fill_qty(cfg, state, actual_buy_price)
+                # Match this sell against the correct open buy lot, sized by
+                # what the sell actually executed (a smaller fill shrinks the lot)
+                executed = await self._final_executed_qty(self._http, cfg.symbol, oid)
+                actual_buy_price, qty = self._close_lot_for_sell(cfg, state, sell_price, executed)
 
                 # Fees: 0.1% per side, each on its own notional (the old code
                 # charged the buy-side fee on the sell price, overstating it)

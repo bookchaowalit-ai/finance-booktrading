@@ -403,3 +403,61 @@ async def test_partial_ordinary_sell_shrinks_its_lot(monkeypatch):
     state.lot_qty = {2_000_000.0: 1.0}
     await bot.kill()
     assert state.lot_qty[2_000_000.0] == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
+async def test_go_symbols_are_read_after_the_stop(monkeypatch):
+    """A signal trade during the stop adds a symbol; drain must see it."""
+    bot, posted = _bot(monkeypatch, open_orders={"BTCTHB": [], "ETHTHB": [], "SOLUSDT": [{"orderId": 51}]})
+    stopped = {"v": False}
+    orig_post = bot._http.post.side_effect
+    orig_get = bot._http.get.side_effect
+
+    async def post(url, json=None):
+        if url.endswith("/api/bot/stop"):
+            stopped["v"] = True
+        return await orig_post(url, json=json)
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"symbols": ["SOLUSDT"] if stopped["v"] else []})
+        return await orig_get(url, params=params)
+
+    bot._http.post = AsyncMock(side_effect=post)
+    bot._http.get = AsyncMock(side_effect=get)
+    await bot.kill()
+    assert [b["orderId"] for u, b in posted if u.endswith("/api/trade/cancel-order")] == [51]
+
+
+@pytest.mark.asyncio
+async def test_containment_waits_for_the_running_tick(monkeypatch):
+    bot, posted = _bot(monkeypatch)
+    async with bot._tick_lock:
+        kill = asyncio.create_task(bot.kill())
+        await asyncio.sleep(0.05)
+        assert not any(u.endswith("/api/trade/cancel-order") for u, _ in posted), "drained during a tick"
+    await kill
+    assert any(u.endswith("/api/trade/cancel-order") for u, _ in posted)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_cancel_is_rechecked_on_retry(monkeypatch):
+    final = {11: 0, 12: None, 21: 0}
+    bot, _ = _bot(monkeypatch, final_executed=final)
+    assert (await bot.kill())["contained"] is False
+
+    # Retry: order 12 is no longer open on the exchange and still unresolved.
+    orig_get = bot._http.get.side_effect
+
+    async def get(url, params=None):
+        if url.endswith("/api/trade/open-orders"):
+            return _response(200, {"orders": []})
+        return await orig_get(url, params=params)
+
+    bot._http.get = AsyncMock(side_effect=get)
+    assert (await bot.kill())["contained"] is False, "12 still unresolved"
+
+    final[12] = 0  # exchange now answers
+    result = await bot.kill()
+    assert result["contained"] is True
+    assert bot.states["BTCTHB"].active_sells == {}
