@@ -153,7 +153,8 @@ func TestStatusListsTradedSymbolsAfterStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ = s.GetStatus(context.Background())
-	if strings.Join(st.Symbols, ",") != "BTCUSDT" { // validGrid trades BTCUSDT; old run's list is gone
+	// Orders from the old run may still be open, so its symbols stay listed.
+	if strings.Join(st.Symbols, ",") != "BTCUSDT,ETHUSDT" {
 		t.Fatalf("after Start got %v", st.Symbols)
 	}
 	s.Stop(context.Background())

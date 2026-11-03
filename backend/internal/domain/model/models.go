@@ -91,8 +91,8 @@ type BotStatus struct {
 	// Symbol is the symbol the running grid/auto loop trades; the strategy
 	// kill switch drains its open orders too.
 	Symbol string `json:"symbol,omitempty"`
-	// Symbols lists every symbol the last run traded (kept after Stop until
-	// the next Start), so a kill retry drains all of them.
+	// Symbols lists every symbol any run traded since the backend started,
+	// so a kill (or retry) drains all of them.
 	Symbols []string `json:"symbols,omitempty"`
 }
 
