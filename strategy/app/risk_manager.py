@@ -191,15 +191,8 @@ class RiskManager:
         self.state.consecutive_losses = 0
         self._log_event("KILL_SWITCH_RESET", "Risk manager reset by user")
         logger.info("Risk manager kill switch reset")
-        
-        # ── Re-enable real grid bot ──
-        try:
-            from app.real_grid_bot import get_real_grid_bot
-            bot = get_real_grid_bot()
-            bot.enable()
-            logger.info("Real grid bot re-enabled via risk manager reset")
-        except Exception as e:
-            logger.warning("Failed to re-enable real grid bot on reset: %s", e)
+        # Deliberately does NOT re-enable the real grid bot: resuming trading
+        # is a separate, explicit step (POST /api/real-grid/enable).
 
     def get_status(self) -> Dict:
         """Return current risk metrics for dashboard."""

@@ -2,6 +2,7 @@ package input
 
 import (
 	"context"
+	"errors"
 
 	"trading-bot-system/backend/internal/domain/model"
 )
@@ -53,6 +54,11 @@ type SignalConfig struct {
 	MinStrength    float64 `json:"min_strength"`     // minimum signal strength (0.0-1.0)
 	Quantity       float64 `json:"quantity"`         // trade quantity per signal
 }
+
+// ErrBotNotRunning is returned by BotHandler.Stop when no bot loop is
+// running. Callers that only need the bot stopped (the strategy kill switch)
+// treat it as success.
+var ErrBotNotRunning = errors.New("bot is not running")
 
 // BotHandler defines the interface for handling bot control requests
 type BotHandler interface {

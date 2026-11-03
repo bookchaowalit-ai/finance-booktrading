@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
@@ -225,6 +226,10 @@ func (h *BotHandler) StopBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.botHandler.Stop(r.Context()); err != nil {
+		if errors.Is(err, input.ErrBotNotRunning) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		respondError(w, "Internal server error", err, http.StatusInternalServerError)
 		return
 	}

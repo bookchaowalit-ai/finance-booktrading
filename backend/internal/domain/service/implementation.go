@@ -588,7 +588,7 @@ func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	defer s.runningMu.Unlock()
 
 	if !s.isRunning {
-		return fmt.Errorf("bot is not running")
+		return input.ErrBotNotRunning
 	}
 
 	s.cancel()

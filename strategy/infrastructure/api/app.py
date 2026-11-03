@@ -1482,19 +1482,36 @@ def register_routes(app: FastAPI):
     @app.post("/api/real-grid/kill")
     @auth_required
     async def real_grid_kill(request: Request):
-        """Kill switch — halt all real trading."""
+        """Kill switch — halt real trading, stop the Go grid loop, cancel open orders.
+
+        ``contained`` is False when the Go loop could not be confirmed stopped
+        or an order could not be cancelled: check the exchange by hand.
+        """
         from app.real_grid_bot import get_real_grid_bot
         bot = get_real_grid_bot()
-        bot.disable()
-        return {"status": "killed", "message": "All real trading halted"}
+        result = await bot.kill()
+        message = (
+            "All real trading halted and open orders cancelled"
+            if result["contained"]
+            else "Trading halted but containment is incomplete: check open orders on the exchange"
+        )
+        return {"status": "killed", "message": message, **result}
 
     @app.post("/api/real-grid/enable")
     @auth_required
     async def real_grid_enable(request: Request):
-        """Re-enable real grid bot after kill switch."""
+        """Re-enable real grid bot after kill switch.
+
+        Refused (409) while the risk manager is halted: reset it first with
+        POST /api/risk/reset. Enabling never clears a risk halt.
+        """
         from app.real_grid_bot import get_real_grid_bot
         bot = get_real_grid_bot()
-        bot.enable()
+        if not bot.enable():
+            raise HTTPException(
+                status_code=409,
+                detail="Risk manager is halted: reset it with POST /api/risk/reset first",
+            )
         return {"status": "enabled", "message": "Real trading resumed"}
 
     @app.get("/api/real-grid/notifications")
@@ -1571,11 +1588,14 @@ def register_routes(app: FastAPI):
     @app.post("/api/risk/reset")
     @auth_required
     async def risk_reset(request: Request):
-        """Reset risk manager kill switch."""
+        """Reset risk manager kill switch. Does not resume trading: POST /api/real-grid/enable next."""
         from app.risk_manager import get_risk_manager
         rm = get_risk_manager()
         rm.reset_kill_switch()
-        return {"status": "reset", "message": "Risk manager kill switch reset"}
+        return {
+            "status": "reset",
+            "message": "Risk manager kill switch reset. Trading stays off until POST /api/real-grid/enable",
+        }
 
     # ── Brain Intelligence Layer Endpoints ──
 

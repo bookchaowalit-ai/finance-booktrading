@@ -501,19 +501,101 @@ class RealGridBot:
         if self._http:
             await self._http.aclose()
 
-    def enable(self):
-        """Re-enable the bot after kill switch."""
+    def enable(self) -> bool:
+        """Re-enable the bot after a kill. Returns False while the risk manager is halted.
+
+        Enabling never clears a risk halt: reset it first, deliberately, via
+        ``RiskManager.reset_kill_switch()`` (``POST /api/risk/reset``).
+        """
+        risk = get_risk_manager()
+        if risk.state.halted:
+            logger.warning(
+                "Real Grid Bot enable refused: risk manager halted (%s)", risk.state.halt_reason
+            )
+            return False
         self._enabled = True
         for state in self.states.values():
             state.halted = False
-        # Also reset risk manager kill switch
-        get_risk_manager().reset_kill_switch()
         logger.info("Real Grid Bot ENABLED")
+        return True
 
     def disable(self):
-        """Kill switch — stop all trading."""
+        """Kill switch — stop all trading and start containment.
+
+        From inside the event loop (e.g. a risk halt during a tick) this
+        schedules ``contain()``; callers that can await should use ``kill()``.
+        """
         self._enabled = False
         logger.warning("Real Grid Bot KILLED — all trading halted")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop: open orders NOT cancelled; call kill()")
+            return
+        task = getattr(self, "_contain_task", None)
+        if task is None or task.done():
+            self._contain_task = loop.create_task(self.contain())
+
+    async def kill(self) -> Dict:
+        """Disable trading and wait for containment to finish."""
+        self._enabled = False
+        logger.warning("Real Grid Bot KILLED — all trading halted")
+        return await self.contain()
+
+    async def contain(self) -> Dict:
+        """Stop the Go grid loop, then cancel every open exchange order.
+
+        The Go ``BotServiceImpl`` loop is stopped first so it cannot place new
+        orders behind the drain. Every open order on each configured symbol
+        is cancelled, not just the ones this bot tracks. ``contained`` is True
+        only when the Go loop is confirmed stopped and no cancel failed.
+        """
+        client = self._http or httpx.AsyncClient(timeout=15.0, event_hooks=backend_event_hooks())
+        result: Dict = {"go_bot_stopped": False, "cancelled": 0, "failed": []}
+        try:
+            try:
+                resp = await client.post(f"{BACKEND_API_BASE}/api/bot/stop", json={})
+                # 409 = no Go bot loop running, which is what we want.
+                result["go_bot_stopped"] = resp.status_code in (200, 409)
+                if not result["go_bot_stopped"]:
+                    logger.error("Kill: Go bot stop failed: %s %s", resp.status_code, resp.text)
+            except Exception as e:
+                logger.error("Kill: Go bot stop failed: %s", e)
+
+            for cfg in self.configs:
+                try:
+                    resp = await client.get(
+                        f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": cfg.symbol}
+                    )
+                    resp.raise_for_status()
+                    orders = resp.json().get("orders") or []
+                except Exception as e:
+                    logger.error("Kill: open orders for %s unavailable: %s", cfg.symbol, e)
+                    result["failed"].append({"symbol": cfg.symbol, "orderId": None})
+                    continue
+                state = self.states.get(cfg.symbol)
+                for order in orders:
+                    order_id = order.get("orderId")
+                    if await self._cancel_order(cfg.symbol, str(order_id), client=client):
+                        result["cancelled"] += 1
+                        if state:
+                            for book in (state.active_buys, state.active_sells):
+                                for price, oid in list(book.items()):
+                                    if oid == str(order_id):
+                                        del book[price]
+                            state.order_times.pop(str(order_id), None)
+                    else:
+                        result["failed"].append({"symbol": cfg.symbol, "orderId": order_id})
+                if state:
+                    await self._save_state(cfg.symbol)
+        finally:
+            if client is not self._http:
+                await client.aclose()
+
+        result["contained"] = result["go_bot_stopped"] and not result["failed"]
+        log = logger.warning if result["contained"] else logger.error
+        log("Kill containment: %s", result)
+        return result
 
     def update_config(self, symbol: str, **kwargs) -> bool:
         """Update grid config for a symbol.
@@ -1159,25 +1241,28 @@ class RealGridBot:
         
         logger.info("[RealGrid %s] Grid rebalanced — will place fresh orders at next tick", cfg.symbol)
 
-    async def _cancel_order(self, symbol: str, order_id: str):
-        """Cancel an order via backend."""
+    async def _cancel_order(self, symbol: str, order_id: str, client=None) -> bool:
+        """Cancel an order via backend. Returns True when the backend confirmed it."""
+        client = client or self._http
         try:
-            resp = await self._http.post(
+            resp = await client.post(
                 f"{BACKEND_API_BASE}/api/trade/cancel-order",
                 json={"symbol": symbol, "orderId": int(order_id)},
             )
             if resp.status_code != 200:
                 logger.warning("Failed to cancel order %s: %s", order_id, resp.text)
-            else:
-                # Close the journal entry so cancelled orders don't sit
-                # in the journal as OPEN forever (they'd otherwise dominate
-                # open_entries and make the stats meaningless)
-                try:
-                    await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
-                except Exception as e:
-                    logger.warning("Journal exit (cancel) failed: %s", e)
+                return False
+            # Close the journal entry so cancelled orders don't sit
+            # in the journal as OPEN forever (they'd otherwise dominate
+            # open_entries and make the stats meaningless)
+            try:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+            except Exception as e:
+                logger.warning("Journal exit (cancel) failed: %s", e)
+            return True
         except Exception as e:
             logger.warning("Cancel order failed: %s", e)
+            return False
 
     async def _update_pnl(self, cfg: RealGridConfig, state: RealGridState):
         """PnL is now calculated in _sync_open_orders() when fills are detected.

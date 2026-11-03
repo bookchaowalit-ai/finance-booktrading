@@ -188,6 +188,20 @@ docker compose stop strategy
 docker compose exec redis redis-cli SET poly_paper:kill_override 1
 ```
 
+### Real grid kill (mainnet)
+
+`POST /strategy-api/api/real-grid/kill` (admin) disables the real grid bot,
+stops the Go grid loop (`/api/bot/stop`), then cancels every open order on each
+configured symbol. A risk-manager halt does the same automatically. Read the
+response: `contained: false` means the Go loop was not confirmed stopped or an
+order could not be cancelled (`failed` lists them) — check the exchange by hand.
+
+Resuming is two explicit steps; neither implies the other:
+
+1. `POST /strategy-api/api/risk/reset` clears the risk halt only.
+2. `POST /strategy-api/api/real-grid/enable` resumes trading; it returns 409
+   while the risk manager is still halted.
+
 ### Reset Kill Switch (ONLY when decision tree says GO)
 
 ```bash
