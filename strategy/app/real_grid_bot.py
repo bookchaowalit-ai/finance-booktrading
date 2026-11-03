@@ -748,7 +748,11 @@ class RealGridBot:
         """
         stop_lot = self._stop_lot_for(state, sell_price)
         if executed_qty > 0:
-            await self._realize_sell(state, sell_price, executed_qty, order_id, "PARTIAL_SELL_CANCELLED")
+            booking = await self._realize_sell(state, sell_price, executed_qty, order_id, "PARTIAL_SELL_CANCELLED")
+            # A stop resting for a lot this sell shrank is now oversized.
+            # Containment cancels every order anyway; elsewhere cancel it here.
+            if booking and booking["stops"] and not getattr(self, "_containing", 0):
+                await self._cancel_superseded_stops(state.symbol, state, booking["stops"])
         else:
             try:
                 await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
@@ -930,6 +934,17 @@ class RealGridBot:
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}")
                 status = resp.json()
+                # A Start between the stop and this read: the Go loop may be
+                # placing orders again, so nothing drained now is final.
+                if status.get("is_active"):
+                    logger.error("Kill: Go bot is running again after the stop")
+                    result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
+                # The drain lists and cancels on the current exchange only.
+                current = status.get("exchange") or ""
+                for other in status.get("traded_exchanges") or []:
+                    if current and other != current:
+                        logger.error("Kill: Go traded on %s; this drain only reaches %s", other, current)
+                        result["failed"].append({"symbol": None, "orderId": None, "reason": "other_exchange", "exchange": other})
                 for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
                     if sym:
                         go_symbols.add(sym.upper())

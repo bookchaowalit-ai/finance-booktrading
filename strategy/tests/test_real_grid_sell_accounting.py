@@ -245,3 +245,21 @@ async def test_unfilled_cancelled_sell_is_journalled_cancelled_once(monkeypatch)
     await bot._cancel_stale_orders(cfg, state, 105.0)
 
     assert _journal_exits(bot, "9") == [("9", 0.0, "CANCELLED", 0.0)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_partial_grid_sell_resizes_the_live_stop(monkeypatch):
+    """A stale grid SELL cancelled after selling 0.4 of a 1.0 lot leaves a
+    stop sized for 1.0: it is cancelled and re-armed for 0.6."""
+    state = _lot_with_live_stop()
+    bot, cfg, posted = _bot(monkeypatch, state, final_executed={5: 0.4, 7: 0})
+    state.order_times["5"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    state.order_times["7"] = time.time()
+
+    await bot._cancel_stale_orders(cfg, state, 105.0)
+
+    cancelled = [b["orderId"] for u, b in posted if u.endswith("/api/trade/cancel-order")]
+    assert cancelled == [5, 7]
+    assert state.active_sells == {}
+    assert state.lot_qty[100.0] == pytest.approx(0.6)
+    assert state.stop_loss_triggered[100.0] is False
