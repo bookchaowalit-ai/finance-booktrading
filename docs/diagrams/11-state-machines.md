@@ -45,16 +45,17 @@ stateDiagram-v2
     Active --> Active: check_order_allowed passes
     Active --> Halted: daily loss, consecutive losses or drawdown over limit -> _halt()
     Halted --> Halted: daily reset keeps halt
-    Halted --> Active: reset_kill_switch() via admin POST /api/risk/reset
-    Halted --> Active: admin POST /api/real-grid/enable, RealGridBot.enable() also calls reset_kill_switch()
+    Halted --> ResetPendingEnable: reset_kill_switch() via admin POST /api/risk/reset
+    ResetPendingEnable --> Active: admin POST /api/real-grid/enable
+    Halted --> Halted: POST /api/real-grid/enable refused with 409
     note right of Halted
-        _halt also calls
-        get_real_grid_bot().disable(),
-        open exchange orders are not cancelled
+        _halt calls disable(), which schedules contain():
+        POST /api/bot/stop (Go grid loop),
+        then cancel every open order per symbol
     end note
 ```
 
-Sources: `strategy/app/risk_manager.py` (`check_order_allowed`, `_check_daily_reset`, `_halt`, `reset_kill_switch`), `strategy/infrastructure/api/app.py` (`/api/risk/reset`), `backend/internal/adapter/http/strategy_proxy.go` (reset is admin-only), `strategy/tests/test_kill_switch.py`, `strategy/tests/test_real_grid_halt.py`.
+Sources: `strategy/app/risk_manager.py` (`check_order_allowed`, `_check_daily_reset`, `_halt`, `reset_kill_switch`), `strategy/app/real_grid_bot.py` (`enable`, `disable`, `kill`, `contain`), `strategy/infrastructure/api/app.py` (`/api/risk/reset`, `/api/real-grid/kill`, `/api/real-grid/enable`), `backend/internal/adapter/http/strategy_proxy.go` (reset is admin-only), `strategy/tests/test_kill_switch.py`, `strategy/tests/test_real_grid_halt.py`, `strategy/tests/test_real_grid_kill.py`.
 
 ## 4. DCA bot (`dca_bots.status`)
 

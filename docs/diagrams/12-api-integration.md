@@ -22,8 +22,8 @@ API reference แบบละเอียดมีอยู่แล้วใน
 | DEX | `/api/dex/*` | user / user (`provider/switch` admin write) | `dex_handler.go` |
 | Per-user bots | `/api/dca/bots`, `/api/rebalance/*`, `/api/copy/*`, `/api/dashboard/money` | user | `dca_handler.go`, `rebalancing_handler.go`, `copy_trading_handler.go`, `money_handler.go` |
 | Strategy proxy | `/strategy-api/*` | user / admin | `strategy_proxy.go` |
-| WebSocket | `:8081/ws?token=` | valid session | `adapter/websocket/broadcaster.go` |
-| gRPC | `:9000` `TradingService` (SubscribeMarketData, ExecuteOrder, CancelOrder, Get/Start/StopBot), DEX service (GetQuote, Swap, GetTokenInfo, GetBalance) | network only (bind 127.0.0.1 / compose network) | `adapter/grpcserver/`, `proto/trading.proto` |
+| WebSocket | `:8081/ws` (token in `Authorization` header or first `{"type":"auth"}` message; `?token=` → 400) | valid session | `adapter/websocket/broadcaster.go` |
+| gRPC | `:9000` `TradingService` (SubscribeMarketData, ExecuteOrder, CancelOrder, Get/Start/StopBot), DEX service (GetQuote, Swap, GetTokenInfo, GetBalance) | `authorization: Bearer $AUTH_TOKEN` metadata + bind 127.0.0.1 / compose network | `adapter/grpcserver/`, `proto/trading.proto` |
 
 Sources: `backend/internal/adapter/http/route_access.go`, `backend/internal/adapter/http/handler.go`, handler files ตามตาราง, `backend/cmd/main.go`, `proto/trading.proto`.
 

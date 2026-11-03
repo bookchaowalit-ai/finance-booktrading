@@ -13,11 +13,11 @@ flowchart TD
     end
     subgraph Contain["Contain"]
         C1{"Real money at risk?"}
-        C2["Admin POST /strategy-api/api/real-grid/kill"]
-        C3["RiskManager already halted: leave halted"]
-        C2b["Go grid bot running? Admin POST /api/bot/stop and /api/trading/stop, confirm stopped"]
-        C4["List open orders: GET /api/trade/open-orders per symbol"]
-        C5["Cancel each: POST /api/trade/cancel-order, or cancel on exchange UI"]
+        C2["Admin POST /strategy-api/api/real-grid/kill: stops Go grid loop, then cancels every open order per symbol"]
+        C3["RiskManager halted: contain() already ran; leave halted"]
+        C2b{"Response contained = true?"}
+        C4["Check failed[] and go_bot_stopped; GET /api/trade/open-orders per symbol, incl. symbols outside REAL_SYMBOLS"]
+        C5["Cancel leftovers: POST /api/trade/cancel-order, or exchange UI; Go loop: POST /api/bot/stop"]
         C6{"Open orders = 0?"}
     end
     subgraph Triage["Triage"]
@@ -33,7 +33,7 @@ flowchart TD
     subgraph Learn["Record"]
         P1["Entry in docs/EVIDENCE_LOG.md: context, bugs, verification"]
         P2["Gate status in docs/READINESS_CHECKLIST.md"]
-        P3["Kill switch reset only per strategy/RUNBOOK.md rules"]
+        P3["Reset per strategy/RUNBOOK.md: POST /api/risk/reset, then POST /api/real-grid/enable (409 while halted)"]
     end
     A1 --> C1
     A2 --> T1
@@ -43,8 +43,9 @@ flowchart TD
     C1 -->|"already halted"| C3
     C1 -->|"no"| T1
     C2 --> C2b
-    C3 --> C2b
-    C2b --> C4
+    C3 --> C4
+    C2b -->|"no"| C4
+    C2b -->|"yes"| C6
     C4 --> C5 --> C6
     C6 -->|"no"| C4
     C6 -->|"yes, contained"| T1
@@ -56,11 +57,11 @@ flowchart TD
     P1 --> P2 --> P3
 ```
 
-หมายเหตุ: kill ของ Python `RealGridBot` ไม่หยุด Go `BotServiceImpl.gridTradingLoop` (`backend/internal/domain/service/implementation.go`) ที่เริ่มผ่าน `/api/bot/start` หรือ `/api/trading/start` — ต้อง stop ฝั่ง Go ก่อน ไม่งั้น order ใหม่อาจถูกวางหลังจาก cancel แล้ว (`backend/internal/adapter/http/handler.go` `/api/bot/stop`, `/api/trading/stop`)
+หมายเหตุ: kill (`RealGridBot.kill()` / `contain()`) เรียก `POST /api/bot/stop` ด้วย service token ก่อน cancel เพื่อไม่ให้ Go `BotServiceImpl.gridTradingLoop` วาง order ใหม่หลัง drain; 409 = ไม่มี loop รันอยู่ (`input.ErrBotNotRunning`). `/api/bot/stop` กับ `/api/trading/stop` หยุด `BotServiceImpl` ตัวเดียวกัน.
 
 Sources: `strategy/app/webhook_notifier.py` (`send_kill_switch_alert`, `send_fill_alert`, `send_error_alert`), `strategy/app/real_grid_bot.py`, `frontend/src/lib/sentry.ts`, `strategy/scripts/monitor.py`, `infra/scripts/monitor.sh`, `PRODUCTION.md` (Troubleshooting), `strategy/RUNBOOK.md` ("When NOT to Reset Kill Switch"), `docs/EVIDENCE_LOG.md` (2026-07-23 entry: cross-check กับ Binance TH `GET /api/v1/order`, LEFT JOIN `real_trades` ↔ `trade_journal`), `docs/READINESS_CHECKLIST.md`, `.github/workflows/ci-cd.yml`, `RUNBOOK.md` (Owner: "Solo operator, no multi-person on-call").
 
-Kill / halt ไม่ cancel order: `RealGridBot.disable()` แค่ตั้ง `_enabled = False` และ `RiskManager._halt()` เรียก `disable()` (`strategy/app/real_grid_bot.py`, `strategy/app/risk_manager.py`, `/api/real-grid/kill` ใน `app.py`) — limit order ที่ค้างที่ exchange ยัง fill ต่อได้ จึงต้องตรวจและ cancel open orders ก่อนถือว่า contained. Endpoint ที่ใช้ได้: `/api/trade/open-orders`, `/api/trade/cancel-order` (service route; admin session หรือ service token, `route_access.go`) หรือ `infra/scripts/monitor.sh` ที่นับ open orders ของ 5 symbol.
+Kill / halt cancel order แล้ว: `/api/real-grid/kill` รอ containment จบแล้วตอบ `{go_bot_stopped, cancelled, failed, contained}`; `RiskManager._halt()` → `disable()` schedule `contain()` แบบเดียวกัน (`strategy/app/real_grid_bot.py`, `strategy/app/risk_manager.py`, `test_real_grid_kill.py`). ยังต้องตรวจเองเมื่อ `contained` เป็น false, หรือมี order บน symbol ที่ไม่อยู่ใน `REAL_SYMBOLS`. Endpoint: `/api/trade/open-orders`, `/api/trade/cancel-order` (service route) หรือ `infra/scripts/monitor.sh` ที่นับ open orders ของ 5 symbol.
 
 ## Roles
 

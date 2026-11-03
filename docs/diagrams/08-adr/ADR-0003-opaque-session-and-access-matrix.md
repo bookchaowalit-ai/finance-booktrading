@@ -31,7 +31,7 @@ flowchart TD
 ## Consequences
 
 - Token ใน `localStorage` อ่านได้ถ้ามี XSS (ไม่มี httpOnly); CSP ใน `Caddyfile` อนุญาต `'unsafe-inline' 'unsafe-eval'`.
-- WebSocket รับ token ทาง query `?token=` (`broadcaster.go`) ซึ่งอาจไปอยู่ใน access log.
+- WebSocket ไม่รับ token ใน URL (`?token=` → 400): `Authorization: Bearer` ตอน upgrade หรือ `{"type":"auth","token":...}` เป็น message แรก (`broadcaster.go`, 2026-11-03).
 - Lockout เก็บใน memory ของ process (UPGRADE-PLAN P1 ให้ย้ายไป Redis).
 
 ## Evidence

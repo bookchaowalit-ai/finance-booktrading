@@ -359,5 +359,5 @@ Sources: `backend/migrations/010_add_dca_bots.up.sql`, `015_add_copy_trading.up.
 ## Open questions
 
 - `exchange_api_keys.api_key/api_secret` เข้ารหัส AES-256-GCM ด้วย key ที่ derive จาก `ENCRYPTION_KEY` (`backend/internal/adapter/database/api_keys.go`) — มี rotation plan หรือไม่?
-- `dex_wallets.private_key_encrypted` เข้ารหัสด้วย AES-GCM แต่ key เป็น string คงที่ใน source (`getEncryptionKey()` ใน `backend/internal/domain/service/wallet_service.go`: "For now, use a fixed 32-byte key") — ใครมี DB dump ก็ถอดได้. มี wallet จริงในตารางนี้หรือไม่? (ดู [13-threat-model](13-threat-model.md))
+- `dex_wallets.private_key_encrypted`: AES-256-GCM, key จาก `DEX_WALLET_ENCRYPTION_KEY` (HKDF) ตั้งแต่ 2026-11-03. Row ที่สร้างก่อนนั้นใช้ key คงที่ซึ่งอยู่ใน git history — ต้อง re-key ด้วย `backend/cmd/rekey-dex-wallets` (ดู [13-threat-model](13-threat-model.md)).
 - `finance_recurring_transactions` สร้าง repository แต่ "Initialized but not yet wired" (`cmd/main.go`) — ยังต้องการหรือไม่?
