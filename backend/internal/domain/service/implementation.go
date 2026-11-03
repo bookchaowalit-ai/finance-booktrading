@@ -492,11 +492,9 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 		return fmt.Errorf("failed to update bot status: %w", err)
 	}
 
-	// The previous run's traded symbols stay listed until this run has
-	// really started, so a failed Start cannot hide them from a kill retry.
-	s.tradedMu.Lock()
-	s.tradedSymbols = nil
-	s.tradedMu.Unlock()
+	// Traded symbols accumulate for the process lifetime: an earlier run's
+	// orders may still be open, so a new Start never drops them from the
+	// kill switch's drain list.
 	if params != nil && params.Symbol != "" {
 		s.noteTradedSymbol(params.Symbol)
 	}

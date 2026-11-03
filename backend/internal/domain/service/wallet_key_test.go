@@ -1,12 +1,14 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-const testWalletKey = "test-dex-wallet-key-0123456789abcdef"
+// A deliberately low-entropy fixture (not a real key; keeps secret scanners quiet).
+var testWalletKey = strings.Repeat("test-key-", 4)
 
 func TestDexWalletKeyMissingFailsClosed(t *testing.T) {
 	t.Setenv(DexWalletKeyEnv, "")
