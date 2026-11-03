@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -327,9 +328,12 @@ type BotServiceImpl struct {
 	exchangeManager *exchange.ExchangeManager // pointer so nil comparison works
 	isRunning       bool
 	runningMu       sync.RWMutex
-	startedAt       time.Time
-	ctx             context.Context
-	cancel          context.CancelFunc
+	// loops tracks the trading goroutines of the current run; Stop waits for
+	// them so no order submission is still in flight when it returns.
+	loops     sync.WaitGroup
+	startedAt time.Time
+	ctx       context.Context
+	cancel    context.CancelFunc
 	// Grid trading fields
 	symbol      string
 	quantity    float64
@@ -545,7 +549,7 @@ func (s *BotServiceImpl) startGridMode(ctx context.Context, params *input.BotSta
 	})
 
 	logger.Info("Grid trading bot started", "symbol", grid.symbol, "grid_levels", grid.gridLevels)
-	go s.gridTradingLoop(ctx, grid)
+	s.goLoop(func() { s.gridTradingLoop(ctx, grid) })
 }
 
 // startSignalMode must be called with runningMu held.
@@ -558,7 +562,8 @@ func (s *BotServiceImpl) startSignalMode(ctx context.Context) {
 	})
 
 	logger.Info("Trading bot started (signal mode)")
-	go s.listenForOrderSignals(ctx, withSignalDefaults(s.signalConfig))
+	cfg := withSignalDefaults(s.signalConfig)
+	s.goLoop(func() { s.listenForOrderSignals(ctx, cfg) })
 }
 
 // startAutoMode must be called with runningMu held.
@@ -579,15 +584,32 @@ func (s *BotServiceImpl) startAutoMode(ctx context.Context) {
 	})
 
 	logger.Info("Auto-adjust bot started", "symbol", symbol, "risk", s.signalConfig.RiskLevel)
-	go s.autoTradingLoop(ctx, withSignalDefaults(s.signalConfig))
+	cfg := withSignalDefaults(s.signalConfig)
+	s.goLoop(func() { s.autoTradingLoop(ctx, cfg) })
 }
 
-// Stop stops the trading bot
+// ErrBotStopTimeout means Stop cancelled the run but a trading loop did not
+// exit within botStopJoinTimeout, so an order may still be in flight.
+var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time")
+
+// botStopJoinTimeout bounds how long Stop waits for the loops to exit.
+var botStopJoinTimeout = 30 * time.Second
+
+// goLoop runs a trading loop that Stop waits for.
+func (s *BotServiceImpl) goLoop(fn func()) {
+	s.loops.Add(1)
+	go func() {
+		defer s.loops.Done()
+		fn()
+	}()
+}
+
+// Stop stops the trading bot and waits for its loops to exit. The loops take
+// runningMu, so the wait happens after the lock is released.
 func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.runningMu.Lock()
-	defer s.runningMu.Unlock()
-
 	if !s.isRunning {
+		s.runningMu.Unlock()
 		return input.ErrBotNotRunning
 	}
 
@@ -602,6 +624,19 @@ func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.investment = 0
 	s.signalConfig = input.SignalConfig{}
 	s.positions = make(map[string]*positionInfo)
+	s.runningMu.Unlock()
+
+	joined := make(chan struct{})
+	go func() {
+		s.loops.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(botStopJoinTimeout):
+		logger.Error("Trading loop did not exit after stop", "timeout", botStopJoinTimeout)
+		return ErrBotStopTimeout
+	}
 
 	if err := s.botStatusRepo.SetActive(ctx, false); err != nil {
 		return fmt.Errorf("failed to update bot status: %w", err)
