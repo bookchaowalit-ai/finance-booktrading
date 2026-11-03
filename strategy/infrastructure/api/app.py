@@ -1490,12 +1490,17 @@ def register_routes(app: FastAPI):
         from app.real_grid_bot import get_real_grid_bot
         bot = get_real_grid_bot()
         result = await bot.kill()
-        message = (
-            "All real trading halted and open orders cancelled"
-            if result["contained"]
-            else "Trading halted but containment is incomplete: check open orders on the exchange"
+        if result["contained"]:
+            return {"status": "killed", "message": "All real trading halted and open orders cancelled", **result}
+        # 503 so callers that only check response.ok surface the failure.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "killed",
+                "message": "Trading halted but containment is incomplete: check open orders on the exchange",
+                **result,
+            },
         )
-        return {"status": "killed", "message": message, **result}
 
     @app.post("/api/real-grid/enable")
     @auth_required

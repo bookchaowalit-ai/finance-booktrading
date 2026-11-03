@@ -154,3 +154,54 @@ async def test_enable_endpoint_is_409_while_risk_halted(monkeypatch):
         resp = await client.post("/api/real-grid/enable", headers={"Authorization": "Bearer t"})
     assert resp.status_code == 409
     assert bot._risk.state.halted is True
+
+
+@pytest.mark.asyncio
+async def test_kill_waits_for_in_flight_order_and_blocks_its_submission(monkeypatch):
+    """A kill during a balance check must not let that order reach the exchange."""
+    monkeypatch.setattr(real_grid_bot, "BINANCE_TH_MAINNET", True)
+    bot, posted = _bot(monkeypatch, open_orders={})
+    cfg = bot.configs[0]
+    state = bot.states[cfg.symbol]
+    state.current_order_size = 0.00005
+    gate = asyncio.Event()
+
+    async def slow_buy_check(*_args):
+        await gate.wait()
+        return True
+
+    bot._can_place_buy = slow_buy_check
+    bot._account_value_quote = AsyncMock(return_value=1_000_000.0)
+    bot._risk.check_order_allowed = MagicMock(return_value=(True, "OK"))
+
+    place = asyncio.create_task(bot._place_grid_order(cfg, state, "BUY", 2_000_000.0))
+    await asyncio.sleep(0)
+    kill = asyncio.create_task(bot.kill())
+    await asyncio.sleep(0.05)
+    assert not kill.done(), "containment must wait for the in-flight order"
+
+    gate.set()
+    assert await place is False
+    result = await kill
+    assert not any(u.endswith("/api/trade/order") for u, _ in posted)
+    assert result["contained"] is True
+
+
+@pytest.mark.asyncio
+async def test_kill_endpoint_fails_loudly_when_not_contained(monkeypatch):
+    from fastapi import FastAPI
+
+    import infrastructure.api.app as api_module
+
+    bot, _ = _bot(monkeypatch, stop_status=500)
+    monkeypatch.setattr(api_module, "API_TOKEN", "t")
+    app = FastAPI()
+    app.state.config = {}
+    api_module.register_routes(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/real-grid/kill", headers={"Authorization": "Bearer t"})
+    assert resp.status_code == 503
+    assert resp.json()["contained"] is False
+    assert bot._enabled is False
