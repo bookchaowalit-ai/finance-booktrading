@@ -597,6 +597,7 @@ func main() {
 	}()
 
 	// Start gRPC server
+	grpcServer.SetServiceToken(os.Getenv("AUTH_TOKEN"))
 	if err := grpcServer.Start(); err != nil {
 		logger.Error("Failed to start gRPC server", "error", err)
 	}

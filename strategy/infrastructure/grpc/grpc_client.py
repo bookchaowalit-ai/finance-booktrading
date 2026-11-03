@@ -2,6 +2,7 @@
 gRPC client for communicating with the Go backend.
 """
 import logging
+import os
 from typing import Optional, List, Callable
 
 import grpc
@@ -39,8 +40,17 @@ class GRPCClient:
         self.bot_stub: Optional[trading_pb2_grpc.BotStatusServiceStub] = None
         self.market_data_stub: Optional[trading_pb2_grpc.MarketDataServiceStub] = None
     
+    @staticmethod
+    def _metadata() -> list:
+        """Bearer metadata the backend requires on every gRPC call."""
+        token = (os.getenv("AUTH_TOKEN") or "").strip()
+        return [("authorization", f"Bearer {token}")] if token else []
+
     def connect(self) -> bool:
         """Connect to the gRPC server."""
+        if not self._metadata():
+            logger.error("AUTH_TOKEN is not set: the backend rejects unauthenticated gRPC calls")
+            return False
         try:
             self.channel = grpc.insecure_channel(
                 f"{self.host}:{self.port}",
@@ -95,7 +105,7 @@ class GRPCClient:
         )
         
         try:
-            response = self.order_stub.ExecuteOrder(request, timeout=10)
+            response = self.order_stub.ExecuteOrder(request, timeout=10, metadata=self._metadata())
             logger.info(
                 f"Order executed: {response.order_id} - {response.status}"
             )
@@ -116,7 +126,7 @@ class GRPCClient:
         )
         
         try:
-            response = self.order_stub.CancelOrder(request, timeout=10)
+            response = self.order_stub.CancelOrder(request, timeout=10, metadata=self._metadata())
             logger.info(f"Order cancelled: {response.message}")
             return response.success
         except grpc.RpcError as e:
@@ -133,6 +143,7 @@ class GRPCClient:
             response = self.bot_stub.GetBotStatus(
                 GetBotStatusRequest(),
                 timeout=5,
+                metadata=self._metadata(),
             )
             return response
         except grpc.RpcError as e:
@@ -146,7 +157,7 @@ class GRPCClient:
             return False
         
         try:
-            response = self.bot_stub.StartBot(StartBotRequest(), timeout=10)
+            response = self.bot_stub.StartBot(StartBotRequest(), timeout=10, metadata=self._metadata())
             logger.info(f"Bot started: {response.message}")
             return response.success
         except grpc.RpcError as e:
@@ -160,7 +171,7 @@ class GRPCClient:
             return False
         
         try:
-            response = self.bot_stub.StopBot(StopBotRequest(), timeout=10)
+            response = self.bot_stub.StopBot(StopBotRequest(), timeout=10, metadata=self._metadata())
             logger.info(f"Bot stopped: {response.message}")
             return response.success
         except grpc.RpcError as e:
@@ -180,7 +191,7 @@ class GRPCClient:
         request = SubscribeRequest(symbols=symbols)
         
         try:
-            responses = self.market_data_stub.SubscribeMarketData(request)
+            responses = self.market_data_stub.SubscribeMarketData(request, metadata=self._metadata())
             for response in responses:
                 callback(response)
         except grpc.RpcError as e:

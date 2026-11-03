@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 	"trading-bot-system/backend/internal/logger"
 
 	"trading-bot-system/backend/internal/domain/model"
@@ -177,6 +178,14 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// wsAuthTimeout bounds how long an unauthenticated socket may stay open
+// waiting for its {"type":"auth"} message.
+var wsAuthTimeout = 10 * time.Second
+
+// wsReadLimit caps client messages (auth, ping, subscribe are all tiny) so an
+// unauthenticated socket cannot make the server buffer a large frame.
+const wsReadLimit = 4096
+
 // Upgrader for WebSocket connections with origin validation
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -198,26 +207,27 @@ func NewWSHandler(broadcaster *WebSocketBroadcasterImpl, authValidator func(toke
 	}
 }
 
-// HandleWebSocket handles WebSocket upgrade and connection
+// HandleWebSocket handles WebSocket upgrade and connection.
+//
+// The session token never travels in the URL (URLs land in proxy access
+// logs). Non-browser clients send "Authorization: Bearer <token>" on the
+// upgrade request; browsers, which cannot set that header, connect and send
+// {"type":"auth","token":"<token>"} as their first message within
+// wsAuthTimeout. Nothing is broadcast to a socket until it authenticates.
 func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Require authentication via token query parameter
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		// Also try Authorization header for subprotocol compatibility
-		auth := r.Header.Get("Authorization")
-		if strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
-		}
+	if r.URL.Query().Has("token") {
+		http.Error(w, `{"error":"Do not put the token in the URL. Send Authorization: Bearer <token>, or {\"type\":\"auth\",\"token\":...} as the first message"}`, http.StatusBadRequest)
+		return
 	}
-
-	if token == "" {
-		http.Error(w, `{"error":"Authentication required. Pass token as ?token=xxx or Authorization: Bearer xxx"}`, http.StatusUnauthorized)
+	if h.authValidator == nil {
+		http.Error(w, `{"error":"Authentication unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
 
-	// Validate the token
-	if h.authValidator != nil {
-		if _, valid := h.authValidator(token); !valid {
+	headerToken := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		headerToken = strings.TrimPrefix(auth, "Bearer ")
+		if _, valid := h.authValidator(headerToken); !valid {
 			http.Error(w, `{"error":"Invalid or expired authentication token"}`, http.StatusUnauthorized)
 			return
 		}
@@ -226,6 +236,13 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("Failed to upgrade WebSocket connection", "error", err)
+		return
+	}
+
+	conn.SetReadLimit(wsReadLimit)
+
+	if headerToken == "" && !h.authenticateFirstMessage(conn) {
+		conn.Close()
 		return
 	}
 
@@ -248,6 +265,27 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// authenticateFirstMessage reads the {"type":"auth","token":...} message and
+// replies {"type":"auth_ok"}, or closes with a policy violation.
+func (h *WSHandler) authenticateFirstMessage(conn *websocket.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(wsAuthTimeout))
+	var msg struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}
+	err := conn.ReadJSON(&msg)
+	conn.SetReadDeadline(time.Time{})
+	if err == nil && msg.Type == "auth" && msg.Token != "" {
+		if _, valid := h.authValidator(msg.Token); valid {
+			return conn.WriteJSON(map[string]string{"type": "auth_ok"}) == nil
+		}
+	}
+	conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "authentication required"),
+		time.Now().Add(time.Second))
+	return false
 }
 
 func (h *WSHandler) handleMessages(conn *websocket.Conn) {

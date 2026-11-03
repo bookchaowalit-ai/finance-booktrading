@@ -2,6 +2,7 @@
  * WebSocket service for real-time data streaming.
  */
 import { MarketData, BotStatus, Order, WebSocketMessage, TradeNotification, BotActivity } from '@/types';
+import { getAuthToken } from './auth-headers';
 
 export type WebSocketMessageHandler = (message: WebSocketMessage) => void;
 
@@ -25,12 +26,20 @@ export class WebSocketService {
       return;
     }
 
+    // The backend only streams to authenticated sockets. The token goes in
+    // the first message, never the URL (URLs end up in proxy access logs).
+    const token = getAuthToken();
+    if (!token) {
+      return;
+    }
+
     this.intentionalClose = false;
 
     try {
       this.ws = new WebSocket(this.url);
 
       this.ws.onopen = () => {
+        this.ws?.send(JSON.stringify({ type: 'auth', token }));
         console.log('WebSocket connected');
         this.reconnectAttempts = 0;
       };
@@ -38,6 +47,9 @@ export class WebSocketService {
       this.ws.onmessage = (event) => {
         try {
           const message: WebSocketMessage = JSON.parse(event.data);
+          if ((message.type as string) === 'auth_ok') {
+            return;
+          }
           this.messageHandlers.forEach((handler) => handler(message));
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
