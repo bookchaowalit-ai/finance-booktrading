@@ -1,32 +1,88 @@
-"""A stop-loss sell that leaves the book unfilled must re-arm protection."""
+"""Stop-loss protection after its sell leaves the book."""
 
-from unittest.mock import AsyncMock
+import time
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from app.real_grid_bot import RealGridBot, RealGridConfig, RealGridState
 
+BUY = 100_000.0
+STOP = 96_000.0
 
-@pytest.mark.asyncio
-async def test_stop_loss_rearms_after_its_sell_is_cancelled():
+
+def _setup():
     cfg = RealGridConfig(symbol="ETHTHB", buy_only=False, stop_loss_pct=3.0)
     bot = RealGridBot(configs=[cfg])
-    buy = 100_000.0
     state = RealGridState(
         symbol="ETHTHB",
-        filled_buy_prices={buy: True},
-        buy_fill_prices={buy: 1.0},
-        stop_loss_triggered={buy: True},
-        stop_loss_orders={buy: 96_000.0},
-        active_sells={},  # the stop sell was cancelled (e.g. by kill containment)
+        filled_buy_prices={BUY: 0},
+        buy_fill_prices={BUY: time.time()},
+        stop_loss_triggered={BUY: True},
+        stop_loss_orders={BUY: STOP},
+        active_sells={STOP: "77"},
     )
     bot.states[cfg.symbol] = state
+    bot._journal = MagicMock(record_exit=AsyncMock())
+    bot._save_state = AsyncMock()
     bot._place_grid_order = AsyncMock(return_value=True)
+    return bot, cfg, state
 
-    # First tick after the cancel, and a second one: protection must come back.
-    await bot._check_stop_loss(cfg, state, 95_000.0)
+
+@pytest.mark.asyncio
+async def test_confirmed_cancel_by_containment_rearms_stop_loss():
+    bot, cfg, state = _setup()
+    req = httpx.Request("GET", "http://backend")
+
+    async def get(url, params=None):
+        return httpx.Response(200, json={"orders": [{"orderId": 77, "side": "SELL", "executedQty": "0"}]}, request=req)
+
+    async def post(url, json=None):
+        return httpx.Response(200, json={}, request=req)
+
+    bot._http = MagicMock(get=AsyncMock(side_effect=get), post=AsyncMock(side_effect=post))
+    await bot.kill()
+    assert state.active_sells == {}
+
     await bot._check_stop_loss(cfg, state, 95_000.0)
 
-    bot._place_grid_order.assert_awaited()
+    bot._place_grid_order.assert_awaited_once()
     assert bot._place_grid_order.await_args.args[2] == "SELL"
-    assert state.stop_loss_triggered[buy] is True
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_disappearance_does_not_place_a_second_stop():
+    """An order that vanished with an unknown outcome may have filled."""
+    bot, cfg, state = _setup()
+    state.active_sells = {}
+
+    await bot._check_stop_loss(cfg, state, 95_000.0)
+    await bot._check_stop_loss(cfg, state, 95_000.0)
+
+    bot._place_grid_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exchange_confirmed_cancel_while_halted_rearms_stop_loss():
+    bot, cfg, state = _setup()
+    state.halted = True
+    bot._http = object()
+    bot._verify_fill = AsyncMock(return_value="cancelled")
+
+    await bot._reconcile_halted_orders(cfg, state)
+
+    assert state.stop_loss_triggered[BUY] is False
+    assert BUY not in state.stop_loss_orders
+
+
+@pytest.mark.asyncio
+async def test_stale_cancel_of_stop_sell_rearms_stop_loss():
+    bot, cfg, state = _setup()
+    state.order_times["77"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    bot._cancel_order = AsyncMock(return_value=True)
+
+    await bot._cancel_stale_orders(cfg, state, STOP)
+
+    assert state.active_sells == {}
+    assert state.stop_loss_triggered[BUY] is False

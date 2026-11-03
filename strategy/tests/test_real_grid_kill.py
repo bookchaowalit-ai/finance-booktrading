@@ -205,3 +205,44 @@ async def test_kill_endpoint_fails_loudly_when_not_contained(monkeypatch):
     assert resp.status_code == 503
     assert resp.json()["contained"] is False
     assert bot._enabled is False
+
+
+@pytest.mark.asyncio
+async def test_enable_refused_while_containment_runs(monkeypatch):
+    bot, _ = _bot(monkeypatch)
+    gate = asyncio.Event()
+    original_get = bot._http.get
+
+    async def slow_get(url, params=None):
+        await gate.wait()
+        return await original_get(url, params=params)
+
+    bot._http.get = AsyncMock(side_effect=slow_get)
+    kill = asyncio.create_task(bot.kill())
+    await asyncio.sleep(0.01)
+
+    assert bot.enable() is False
+    assert bot._enabled is False
+    gate.set()
+    await kill
+    assert bot.enable() is True
+
+
+@pytest.mark.asyncio
+async def test_partially_filled_buy_becomes_a_protected_lot(monkeypatch):
+    bot, _ = _bot(
+        monkeypatch,
+        open_orders={"BTCTHB": [{"orderId": 11, "side": "BUY", "executedQty": "0.00002"}], "ETHTHB": []},
+    )
+    state = bot.states["BTCTHB"]
+
+    result = await bot.kill()
+
+    assert 2_000_000.0 in state.filled_buy_prices, "the bought part must stay a position"
+    assert 2_000_000.0 in state.buy_fill_prices
+    assert result["partial_fills"] == [
+        {"symbol": "BTCTHB", "orderId": 11, "side": "BUY", "executedQty": 0.00002}
+    ]
+    # Journal entry stays open: the trade happened, it was not a plain cancel.
+    closed = [c.args[0] for c in bot._journal.record_exit.await_args_list]
+    assert "11" not in closed
