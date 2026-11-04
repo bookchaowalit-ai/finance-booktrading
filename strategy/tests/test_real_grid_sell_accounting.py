@@ -752,3 +752,53 @@ async def test_live_unresolved_order_that_vanishes_before_the_drain_is_retried(m
     info[99] = {"status": "FILLED"}
     assert (await bot.kill())["contained"] is True
     assert state.lot_qty[100.0] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_filled_buy_found_by_sync_is_not_booked_again_by_a_retry(monkeypatch):
+    """Cancel fails, the BUY then fills, a sync books it: the next kill's
+    re-check must not add the fill a second time (1.0 stays 1.0)."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    snapshot = [{"orderId": 11, "side": "BUY", "price": "100"}]
+    info = {11: {"status": "NEW"}}
+    bot, cfg, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={11: 1.0}, order_info=info)
+    _failing_cancel(bot, {11})
+    await bot.kill()
+
+    snapshot.clear()
+    info[11] = {"status": "FILLED"}
+    bot._verify_fill = AsyncMock(return_value="filled")
+    await bot._sync_open_orders(cfg, state)
+
+    await bot.kill()
+    assert bot._lot_quantity(state, 100.0) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_with_unknown_status_waits_for_the_drain(monkeypatch):
+    """Neither an unknown status nor a live partial read is booked; the
+    final 0.4 is, once the exchange reports the order final."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    snapshot = [{"orderId": 99, "side": "BUY", "price": "100"}]
+    bot, _, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={99: 0.4})
+    bot._unresolved_cancels[("BTCTHB", "99")] = ("BUY", 100.0, None)
+    get = bot._http.get.side_effect
+    calls = {"n": 0}
+
+    async def flaky_then_partial(url, params=None):
+        if url.endswith("/api/trade/order-status"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _response(502)
+            if calls["n"] == 2:
+                return _response(200, {"status": "PARTIALLY_FILLED", "executedQty": "0.1"})
+        return await get(url, params=params)
+
+    bot._http.get.side_effect = flaky_then_partial
+    first = await bot.kill()
+    assert first["contained"] is False  # the drain's read was a stale live one
+    assert 100.0 not in state.lot_qty
+
+    retry = await bot.kill()
+    assert retry["contained"] is True
+    assert state.lot_qty[100.0] == pytest.approx(0.4)

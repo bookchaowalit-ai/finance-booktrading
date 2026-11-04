@@ -584,6 +584,8 @@ class RealGridBot:
     # How long an order POST with an unknown outcome can take to show up in
     # open orders (the Go grid uses the same grace for its own submissions).
     UNCERTAIN_GRACE_SEC = 60.0
+    # Exchange statuses after which an order's executed quantity is final.
+    FINAL_ORDER_STATUSES = ("CANCELED", "CANCELLED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED", "FILLED")
 
     def _lot_quantity(self, state: RealGridState, buy_price: float) -> float:
         """Base quantity held by a lot: recorded size, else the order size."""
@@ -938,8 +940,15 @@ class RealGridBot:
         _unresolved_cancels, so sync and the next containment re-check it.
         """
         # The open-orders snapshot can be stale: the order may have filled
-        # further before the cancel landed.
-        executed = await self._final_executed_qty(client, symbol, order_id)
+        # further before the cancel landed. Only a final status gives the
+        # final quantity; a stale live read counts as unknown.
+        known = await self._order_status(client, symbol, order_id)
+        executed = None
+        if known and known.get("status") in self.FINAL_ORDER_STATUSES:
+            try:
+                executed = float(known.get("executedQty") or 0)
+            except (TypeError, ValueError):
+                executed = None
         if executed is None:
             result["unreconciled"].append({"symbol": symbol, "orderId": int(order_id) if order_id.isdigit() else order_id})
             state = self.states.get(symbol)
@@ -1116,20 +1125,23 @@ class RealGridBot:
                         continue
                     side, price, stop_lot = claimed
                     known = await self._order_status(client, symbol, order_id)
-                    if known and known.get("status") in ("NEW", "PARTIALLY_FILLED"):
-                        # Still live (an earlier cancel failed): the drain
-                        # below cancels and books it. Keep the record until
-                        # then, in case it fills before the drain lists it.
+                    final = known and known.get("status") in self.FINAL_ORDER_STATUSES
+                    if not final:
+                        # Live (an earlier cancel failed) or status unknown:
+                        # an executed qty read now could still grow. The
+                        # drain below cancels and books it; keep the record
+                        # until then, in case it leaves the book first.
                         self._unresolved_cancels[(symbol, order_id)] = claimed
                         live_rechecked.append((symbol, order_id))
                         continue
-                    executed = await self._kill_cancel_execution(client, result, symbol, order_id, side, price)
-                    if executed is not None:
-                        side, price = await self._resolve_side(client, symbol, order_id, side, price, executed)
-                        executions.append((symbol, order_id, side, executed, price, stop_lot))
-                    elif stop_lot is not None:
-                        # Still unknown: keep the lot association for the next try.
-                        self._unresolved_cancels[(symbol, order_id)] = (side, price, stop_lot)
+                    try:
+                        executed = float(known.get("executedQty") or 0)
+                    except (TypeError, ValueError):
+                        self._unresolved_cancels[(symbol, order_id)] = claimed
+                        live_rechecked.append((symbol, order_id))
+                        continue
+                    side, price = await self._resolve_side(client, symbol, order_id, side, price, executed)
+                    executions.append((symbol, order_id, side, executed, price, stop_lot))
 
                 symbols = [cfg.symbol for cfg in self.configs]
                 symbols += sorted(sym for sym in go_symbols if sym not in symbols)
@@ -1530,7 +1542,7 @@ class RealGridBot:
             known = await self._order_status(self._http, symbol, order_id)
             # Only a final order can be booked: one whose cancel failed may
             # still be live (and is then still the lot's stop).
-            if not known or known.get("status") not in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FILLED"):
+            if not known or known.get("status") not in self.FINAL_ORDER_STATUSES:
                 continue
             try:
                 executed = float(known.get("executedQty") or 0)
@@ -1598,6 +1610,10 @@ class RealGridBot:
                 # Record buy fill price for later SELL PnL matching
                 state.buy_fill_prices[buy_price] = time.time()  # fill time — used for FIFO fallback matching
                 state.filled_buy_prices[buy_price] = 0  # SELL price unknown yet
+                # One booking ledger with the cancel paths: a retry of a cancel
+                # that failed before this fill must not add it again.
+                state.booked_buys[oid] = self._lot_quantity(state, buy_price)
+                self._unresolved_cancels.pop((cfg.symbol, oid), None)
                 state.orders_filled += 1
                 state.last_fill_timestamp = time.time()
                 logger.info(
