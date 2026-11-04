@@ -408,6 +408,9 @@ class RealGridBot:
                     for (sym, oid), (side, price, stop_lot) in self._unresolved_cancels.items()
                     if sym == symbol
                 ],
+                # Order POSTs with an unknown outcome: they may still go
+                # live, so a kill after a restart must keep waiting them out.
+                "uncertain_submissions": [dict(u) for u in self._uncertain_submissions if u["symbol"] == symbol],
             }
             await self._redis.set(f"real_grid:{symbol}:state", json.dumps(data))
         except Exception as e:
@@ -460,6 +463,9 @@ class RealGridBot:
             state.booked_buys = {str(k): v for k, v in data.get("booked_buys", {}).items()}
             for oid, side, price, stop_lot in data.get("unresolved_cancels", []):
                 self._unresolved_cancels.setdefault((symbol, str(oid)), (side, price, stop_lot))
+            for u in data.get("uncertain_submissions", []):
+                if u not in self._uncertain_submissions:
+                    self._uncertain_submissions.append(dict(u))
             logger.info(
                 "Restored state for %s from Redis: buys=%d sells=%d pnl=%.2f cum_pnl=%.2f order_size=%.6f",
                 symbol, len(state.active_buys), len(state.active_sells), state.daily_pnl,
@@ -2890,21 +2896,23 @@ class RealGridBot:
                     logger.info("Order rejected @ %.2f: %s", price, err)
             elif resp.status_code >= 500:
                 # The backend could not tell whether the exchange took it.
-                self._note_uncertain_submission(cfg.symbol, side, price, f"HTTP {resp.status_code}")
+                await self._note_uncertain_submission(cfg.symbol, side, price, f"HTTP {resp.status_code}")
             else:
                 err = resp.json().get("error", "unknown")
                 logger.info("Order rejected @ %.2f (HTTP %d): %s", price, resp.status_code, err)
         except Exception as e:
             # The request may have reached the exchange before it failed.
-            self._note_uncertain_submission(cfg.symbol, side, price, str(e))
+            await self._note_uncertain_submission(cfg.symbol, side, price, str(e))
         return False
 
-    def _note_uncertain_submission(self, symbol: str, side: str, price: float, why: str):
+    async def _note_uncertain_submission(self, symbol: str, side: str, price: float, why: str):
         logger.error(
             "[RealGrid %s] %s @ %.2f outcome unknown (%s): it may be live on the exchange",
             symbol, side, price, why,
         )
         self._uncertain_submissions.append({"symbol": symbol, "side": side, "price": price, "at": time.time()})
+        # Saved now: a restart before the next tick must not forget it.
+        await self._save_state(symbol)
 
 
     def get_status(self) -> Dict:

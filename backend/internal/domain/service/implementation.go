@@ -648,6 +648,13 @@ var tradedSymbolPersistTimeout = 3 * time.Second
 // noteTradedSymbol records a symbol the bot may hold orders on, durably when
 // the status repository can store it. Callers place no order for the symbol
 // if this fails.
+// RecordTradedSymbol durably notes that an order for symbol is about to go
+// to exchange, for orders placed outside the bot loops (the strategy's
+// grid places through the trade API): the kill switch drains by it.
+func (s *BotServiceImpl) RecordTradedSymbol(ctx context.Context, symbol, exchange string) error {
+	return s.noteTradedSymbol(ctx, symbol, exchange)
+}
+
 func (s *BotServiceImpl) noteTradedSymbol(ctx context.Context, symbol, exchange string) error {
 	if symbol == "" {
 		return nil
@@ -779,22 +786,79 @@ func (s *BotServiceImpl) parkUnknownOrders(symbol string, orders ...*gridPending
 	}
 }
 
+// noteSubmission durably records a submission before it is sent, so an
+// order whose outcome is not known yet survives a backend restart. An order
+// it cannot record is not sent.
+func (s *BotServiceImpl) noteSubmission(ctx context.Context, symbol string, o *gridPendingOrder) error {
+	store, ok := s.botStatusRepo.(repository.UnresolvedOrderStore)
+	if !ok {
+		return nil
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, tradedSymbolPersistTimeout)
+	defer cancel()
+	if err := store.SaveUnresolvedOrder(writeCtx, model.UnresolvedOrder{Symbol: symbol, ClientOrderID: o.clientOrderID, Exchange: o.provider, SubmittedAt: o.submittedAt}); err != nil {
+		// %v, not %w: a timeout here must not read as an unknown exchange outcome.
+		return fmt.Errorf("submission not recorded, order not placed: %v", err)
+	}
+	return nil
+}
+
+// settleSubmission follows a submission up after an exchange answer: a
+// still-unknown one keeps its record (now naming its exchange), any other
+// drops it. A failed delete only leaves a record that Stop resolves.
+func (s *BotServiceImpl) settleSubmission(symbol string, o *gridPendingOrder, unknown bool) {
+	store, ok := s.botStatusRepo.(repository.UnresolvedOrderStore)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tradedSymbolPersistTimeout)
+	defer cancel()
+	var err error
+	if unknown {
+		err = store.SaveUnresolvedOrder(ctx, model.UnresolvedOrder{Symbol: symbol, ClientOrderID: o.clientOrderID, Exchange: o.provider, SubmittedAt: o.submittedAt})
+	} else {
+		err = store.DeleteUnresolvedOrder(ctx, o.clientOrderID)
+	}
+	if err != nil {
+		logger.Warn("Unresolved order record not updated", "symbol", symbol, "clientOrderId", o.clientOrderID, "error", err)
+	}
+}
+
+// storedUnresolved lists the durable submission records (none without a store).
+func (s *BotServiceImpl) storedUnresolved(ctx context.Context) ([]model.UnresolvedOrder, error) {
+	store, ok := s.botStatusRepo.(repository.UnresolvedOrderStore)
+	if !ok {
+		return nil, nil
+	}
+	return store.ListUnresolvedOrders(ctx)
+}
+
 // reconcileUnresolved looks every parked submission up with a context of its
 // own (the run's is cancelled). An order the exchange knows in any state is
 // resolved: an open one is on the book for the kill switch to cancel. One
 // still not found after gridUnknownGrace never reached the exchange.
 func (s *BotServiceImpl) reconcileUnresolved() {
+	ctx, cancel := context.WithTimeout(context.Background(), botStopReconcileTimeout)
+	defer cancel()
+	// Records from an earlier process too: their submissions may go live.
+	stored, err := s.storedUnresolved(ctx)
+	if err != nil {
+		logger.Warn("Stored unresolved orders unreadable", "error", err)
+	}
 	s.tradedMu.Lock()
-	orders := make([]unresolvedOrder, 0, len(s.unresolved))
+	orders := make([]unresolvedOrder, 0, len(s.unresolved)+len(stored))
 	for _, o := range s.unresolved {
 		orders = append(orders, o)
+	}
+	for _, o := range stored {
+		if _, ok := s.unresolved[o.ClientOrderID]; !ok {
+			orders = append(orders, unresolvedOrder{symbol: o.Symbol, clientOrderID: o.ClientOrderID, submittedAt: o.SubmittedAt, provider: o.Exchange})
+		}
 	}
 	s.tradedMu.Unlock()
 	if len(orders) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), botStopReconcileTimeout)
-	defer cancel()
 	for _, o := range orders {
 		report, err := s.lookupFor(o.symbol).lookup(ctx, o.provider, o.clientOrderID, o.submittedAt)
 		if err != nil {
@@ -807,6 +871,7 @@ func (s *BotServiceImpl) reconcileUnresolved() {
 		s.tradedMu.Lock()
 		delete(s.unresolved, o.clientOrderID)
 		s.tradedMu.Unlock()
+		s.settleSubmission(o.symbol, &gridPendingOrder{clientOrderID: o.clientOrderID}, false)
 	}
 }
 
@@ -830,15 +895,28 @@ func (s *BotServiceImpl) lookupFor(symbol string) gridExchange {
 	return &liveGridExchange{symbol: symbol, manager: s.exchangeManager, client: s.tradingClient}
 }
 
-func (s *BotServiceImpl) unresolvedOrderList() []model.UnresolvedOrder {
+func (s *BotServiceImpl) unresolvedOrderList(ctx context.Context) ([]model.UnresolvedOrder, error) {
+	// Fewer than there are would let the kill switch report success while
+	// one may still go live, so an unreadable store fails the read.
+	stored, err := s.storedUnresolved(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s.tradedMu.Lock()
 	defer s.tradedMu.Unlock()
-	out := make([]model.UnresolvedOrder, 0, len(s.unresolved))
+	seen := map[string]bool{}
+	out := make([]model.UnresolvedOrder, 0, len(s.unresolved)+len(stored))
 	for _, o := range s.unresolved {
-		out = append(out, model.UnresolvedOrder{Symbol: o.symbol, ClientOrderID: o.clientOrderID})
+		seen[o.clientOrderID] = true
+		out = append(out, model.UnresolvedOrder{Symbol: o.symbol, ClientOrderID: o.clientOrderID, Exchange: o.provider, SubmittedAt: o.submittedAt})
+	}
+	for _, o := range stored {
+		if !seen[o.ClientOrderID] {
+			out = append(out, o)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ClientOrderID < out[j].ClientOrderID })
-	return out
+	return out, nil
 }
 
 // goLoop runs a trading loop of the current run. Callers hold runningMu.
@@ -954,7 +1032,11 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.Symbols = symbols
 	status.TradedExchanges = exchanges
 	status.Exchange = s.currentExchange()
-	status.UnresolvedOrders = s.unresolvedOrderList()
+	unresolved, err := s.unresolvedOrderList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read unresolved orders: %w", err)
+	}
+	status.UnresolvedOrders = unresolved
 
 	s.runningMu.RLock()
 	// A run that started during the read may have placed orders after a

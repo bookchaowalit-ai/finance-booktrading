@@ -85,9 +85,22 @@ func (s *BotServiceImpl) signalTradeStep(ctx context.Context, book *signalOrderB
 		quantity:      quantity,
 		price:         currentPrice,
 		submittedAt:   book.now(),
+		provider:      ex.currentProvider(),
 	}
-	report, orderErr := ex.place(ctx, order.clientOrderID, side, quantity, currentPrice)
+	if err := s.noteSubmission(ctx, symbol, order); err != nil {
+		logger.Warn("Signal trade order not placed", "symbol", symbol, "side", side, "error", err)
+		s.broadcaster.BroadcastBotActivity(&model.BotActivity{
+			Timestamp: time.Now(),
+			Activity:  "ORDER_FAILED",
+			Symbol:    symbol,
+			Message:   fmt.Sprintf("Signal %s %.4f @ %.2f not placed: %v", side, quantity, currentPrice, err),
+			Level:     "error",
+		})
+		return false
+	}
+	report, orderErr := ex.place(ctx, order.provider, order.clientOrderID, side, quantity, currentPrice)
 	order.provider = report.provider
+	s.settleSubmission(symbol, order, orderErr != nil && exchange.IsOrderStateUnknown(orderErr))
 	if orderErr != nil {
 		if exchange.IsOrderStateUnknown(orderErr) {
 			order.unknown = true
@@ -131,7 +144,11 @@ func (s *BotServiceImpl) reconcileSignalOrder(ctx context.Context, book *signalO
 		})
 		return "", false
 	}
+	wasUnknown := order.unknown
 	filledSide, final = s.applySignalReport(ctx, book, symbol, order, report)
+	if wasUnknown && (final || !order.unknown) {
+		s.settleSubmission(symbol, order, false)
+	}
 	if !final && report.state == gridOrderOpen {
 		s.cancelStaleSignalOrder(ctx, book, symbol, order, ex)
 	}

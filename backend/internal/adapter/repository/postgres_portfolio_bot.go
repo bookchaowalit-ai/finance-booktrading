@@ -190,6 +190,39 @@ func (r *PostgresBotStatusRepository) ListTradedSymbols(ctx context.Context) ([]
 	return out, rows.Err()
 }
 
+// SaveUnresolvedOrder records a submission whose outcome is not known yet.
+func (r *PostgresBotStatusRepository) SaveUnresolvedOrder(ctx context.Context, o model.UnresolvedOrder) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO bot_unresolved_orders (client_order_id, symbol, exchange, submitted_at) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (client_order_id) DO UPDATE SET symbol = EXCLUDED.symbol, exchange = EXCLUDED.exchange, submitted_at = EXCLUDED.submitted_at
+	`, o.ClientOrderID, o.Symbol, o.Exchange, o.SubmittedAt)
+	return err
+}
+
+// DeleteUnresolvedOrder drops a submission whose outcome is known.
+func (r *PostgresBotStatusRepository) DeleteUnresolvedOrder(ctx context.Context, clientOrderID string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM bot_unresolved_orders WHERE client_order_id = $1`, clientOrderID)
+	return err
+}
+
+// ListUnresolvedOrders returns every submission whose outcome is not known.
+func (r *PostgresBotStatusRepository) ListUnresolvedOrders(ctx context.Context) ([]model.UnresolvedOrder, error) {
+	rows, err := r.pool.Query(ctx, `SELECT client_order_id, symbol, exchange, submitted_at FROM bot_unresolved_orders ORDER BY client_order_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.UnresolvedOrder
+	for rows.Next() {
+		var o model.UnresolvedOrder
+		if err := rows.Scan(&o.ClientOrderID, &o.Symbol, &o.Exchange, &o.SubmittedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 // PostgresMarketDataRepository implements MarketDataRepository with PostgreSQL + TimescaleDB
 type PostgresMarketDataRepository struct {
 	pool *pgxpool.Pool

@@ -103,7 +103,8 @@ type lookupStub struct {
 	on     []string
 }
 
-func (l *lookupStub) place(context.Context, string, string, float64, float64) (gridOrderReport, error) {
+func (l *lookupStub) currentProvider() string { return "" }
+func (l *lookupStub) place(context.Context, string, string, string, float64, float64) (gridOrderReport, error) {
 	return gridOrderReport{}, errors.New("place must not be called")
 }
 func (l *lookupStub) lookup(ctx context.Context, provider, id string, at time.Time) (gridOrderReport, error) {

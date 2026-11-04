@@ -71,7 +71,11 @@ type gridOrderReport struct {
 type gridExchange interface {
 	// place submits an order. An error for which exchange.IsOrderStateUnknown
 	// is true means the order may exist.
-	place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error)
+	// provider is the exchange to place on, read with currentProvider and
+	// recorded first ("" = whatever is current then).
+	place(ctx context.Context, provider, clientOrderID, side string, quantity, price float64) (gridOrderReport, error)
+	// currentProvider is the exchange an order placed now would go to.
+	currentProvider() string
 	// lookup returns the state of an order by client order ID. submittedAt
 	// bounds the search on exchanges that cannot query by client order ID.
 	// provider is the exchange the order went to ("" = current provider).
@@ -168,9 +172,24 @@ func (s *BotServiceImpl) gridStep(ctx context.Context, grid gridParams, book *gr
 		quantity:      quantity,
 		price:         currentPrice,
 		submittedAt:   book.now(),
+		// Pinned before the record: the record names the exchange the
+		// order goes to, even if the process dies mid-placement.
+		provider: ex.currentProvider(),
 	}
-	report, orderErr := ex.place(ctx, clientOrderID, side, quantity, currentPrice)
+	if err := s.noteSubmission(ctx, symbol, order); err != nil {
+		logger.Warn("Grid order not placed", "symbol", symbol, "side", side, "error", err)
+		s.broadcaster.BroadcastBotActivity(&model.BotActivity{
+			Timestamp: time.Now(),
+			Activity:  "ORDER_FAILED",
+			Symbol:    symbol,
+			Message:   fmt.Sprintf("Grid %s %.4f @ %.2f not placed: %v", side, quantity, currentPrice, err),
+			Level:     "error",
+		})
+		return ""
+	}
+	report, orderErr := ex.place(ctx, order.provider, clientOrderID, side, quantity, currentPrice)
 	order.provider = report.provider
+	s.settleSubmission(symbol, order, orderErr != nil && exchange.IsOrderStateUnknown(orderErr))
 	if orderErr != nil {
 		if exchange.IsOrderStateUnknown(orderErr) {
 			// The exchange may have accepted it: never re-send blindly.
@@ -225,7 +244,11 @@ func (s *BotServiceImpl) reconcileGridOrder(ctx context.Context, grid gridParams
 		})
 		return ""
 	}
+	wasUnknown := order.unknown
 	filled := s.applyGridReport(grid, book, order, report)
+	if wasUnknown && (book.pending != order || !order.unknown) {
+		s.settleSubmission(grid.symbol, order, false)
+	}
 	if book.pending == order && report.state == gridOrderOpen {
 		s.cancelStaleGridOrder(ctx, grid, book, order, ex)
 	}
@@ -412,11 +435,15 @@ func recordExchange(record func(string) error, ex string) error {
 	return nil
 }
 
-// placeOnPinnedProvider reads the provider once, records it, and submits to
-// that provider, so a provider switch in between cannot send the order to an
-// exchange the kill switch does not know about.
-func placeOnPinnedProvider(ctx context.Context, p providerPlacer, record func(string) error, symbol, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
-	provider := p.GetCurrentProvider()
+// placeOnPinnedProvider records the provider and submits to it: the one
+// the caller pinned (and recorded with its submission), or, when none is
+// given, the current one read once. A provider switch in between cannot send
+// the order to an exchange the kill switch does not know about.
+func placeOnPinnedProvider(ctx context.Context, p providerPlacer, record func(string) error, pinnedProvider, symbol, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+	provider := config.ExchangeProvider(pinnedProvider)
+	if provider == "" {
+		provider = p.GetCurrentProvider()
+	}
 	if err := recordExchange(record, string(provider)); err != nil {
 		return gridOrderReport{}, err
 	}
@@ -436,9 +463,16 @@ func placeOnPinnedProvider(ctx context.Context, p providerPlacer, record func(st
 	return gridOrderReport{state: gridOrderFilled, executedQty: quantity, provider: pinned.provider}, nil
 }
 
-func (e *liveGridExchange) place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+func (e *liveGridExchange) currentProvider() string {
 	if e.manager != nil {
-		return placeOnPinnedProvider(ctx, e.manager, e.record, e.symbol, clientOrderID, side, quantity, price)
+		return string(e.manager.GetCurrentProvider())
+	}
+	return string(config.ExchangeBitkub)
+}
+
+func (e *liveGridExchange) place(ctx context.Context, provider, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+	if e.manager != nil {
+		return placeOnPinnedProvider(ctx, e.manager, e.record, provider, e.symbol, clientOrderID, side, quantity, price)
 	}
 	if err := recordExchange(e.record, string(config.ExchangeBitkub)); err != nil {
 		return gridOrderReport{}, err

@@ -13,7 +13,9 @@ type fakeGridExchange struct {
 	fail   error
 }
 
-func (f *fakeGridExchange) place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+func (f *fakeGridExchange) currentProvider() string { return "" }
+
+func (f *fakeGridExchange) place(ctx context.Context, provider, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
 	if f.fail != nil {
 		return gridOrderReport{}, f.fail
 	}

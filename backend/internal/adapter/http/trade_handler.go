@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	"trading-bot-system/backend/internal/adapter/exchange"
@@ -19,11 +22,46 @@ import (
 type TradeHandler struct {
 	manager *exchange.ExchangeManager
 	db      *pgxpool.Pool
+	// recordTraded durably notes (symbol, exchange) before an order is
+	// placed, so the kill switch knows every exchange orders went to.
+	recordTraded func(ctx context.Context, symbol, exchange string) error
+	// marketExists checks the exchange lists the symbol before it is
+	// recorded; knownMarkets keeps the "provider|symbol" pairs it accepted.
+	marketExists func(ctx context.Context, provider config.ExchangeProvider, symbol string) error
+	knownMarkets sync.Map
+}
+
+// SetTradedSymbolRecorder makes PlaceOrder record each order's symbol and
+// exchange first; an order whose record fails is not placed.
+func (h *TradeHandler) SetTradedSymbolRecorder(record func(ctx context.Context, symbol, exchange string) error) {
+	h.recordTraded = record
 }
 
 // NewTradeHandler creates a new trade handler
 func NewTradeHandler(manager *exchange.ExchangeManager, db *pgxpool.Pool) *TradeHandler {
-	return &TradeHandler{manager: manager, db: db}
+	h := &TradeHandler{manager: manager, db: db}
+	h.marketExists = func(ctx context.Context, provider config.ExchangeProvider, symbol string) error {
+		ticker, err := manager.GetTickerOn(ctx, provider, symbol)
+		return listedMarket(symbol, ticker, err)
+	}
+	return h
+}
+
+// marketSymbol is a plain market name (BTCTHB, Bitkub's THB_BTC): the symbol
+// is put into exchange URLs unescaped.
+var marketSymbol = regexp.MustCompile(`^[A-Za-z0-9_]{2,30}$`)
+
+// listedMarket accepts a ticker only when it names the requested market and
+// has a price: Binance Global parses an "Invalid symbol" error body into an
+// empty ticker with no error.
+func listedMarket(symbol string, ticker *exchange.TickerInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if ticker == nil || !strings.EqualFold(ticker.Symbol, symbol) || ticker.LastPrice <= 0 {
+		return fmt.Errorf("no ticker for %s", symbol)
+	}
+	return nil
 }
 
 // RegisterRoutes registers real trade routes
@@ -77,6 +115,10 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol is required"})
 		return
 	}
+	if !marketSymbol.MatchString(req.Symbol) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol must be letters, digits or _"})
+		return
+	}
 	if req.Side != "BUY" && req.Side != "SELL" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "side must be BUY or SELL"})
 		return
@@ -93,7 +135,28 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		"price", req.Price,
 	)
 
-	result, err := h.manager.PlaceOrder(r.Context(), req.Symbol, req.Side, req.Quantity, req.Price)
+	// The provider is read once: the order goes to the exchange recorded.
+	provider := h.manager.GetCurrentProvider()
+	if h.recordTraded != nil {
+		// A recorded symbol stays in every kill switch drain, so only a
+		// market the exchange lists is recorded.
+		key := string(provider) + "|" + req.Symbol
+		if _, known := h.knownMarkets.Load(key); !known {
+			if err := h.marketExists(r.Context(), provider, req.Symbol); err != nil {
+				logger.Error("Market not found, order not placed", "symbol", req.Symbol, "exchange", provider, "error", err)
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("symbol %s not available on %s, order not placed", req.Symbol, provider)})
+				return
+			}
+			h.knownMarkets.Store(key, true)
+		}
+		if err := h.recordTraded(r.Context(), req.Symbol, string(provider)); err != nil {
+			logger.Error("Traded symbol not recorded, order not placed", "symbol", req.Symbol, "error", err)
+			// 409, not 5xx: the order was definitely not sent.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "traded symbol not recorded, order not placed"})
+			return
+		}
+	}
+	result, err := h.manager.PlaceOrderOn(r.Context(), provider, req.Symbol, req.Side, req.Quantity, req.Price)
 	if err != nil {
 		logger.Error("Real trade order failed", "error", err)
 		writeJSON(w, placeOrderErrorStatus(err), map[string]string{

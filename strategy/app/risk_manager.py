@@ -119,9 +119,11 @@ class RiskManager:
             self._halt(f"Max drawdown hit: {self.state.current_drawdown_pct:.1f}%")
             return False, self.state.halt_reason
 
-        # 7. Order size check
+        # 7. Order size check: it bounds new exposure, so BUYs only. A SELL
+        # exits coins already held (callers check the balance); capping it
+        # would leave a lot built from several fills without its stop-loss.
         notional = quantity * price
-        if notional > self.config.max_order_size_thb:
+        if side == "BUY" and notional > self.config.max_order_size_thb:
             return False, f"Order too large: {notional:.0f} THB > max {self.config.max_order_size_thb:.0f} THB"
 
         # 8. Risk per trade
