@@ -396,6 +396,9 @@ class RealGridBot:
                 "stop_loss_triggered": {str(k): v for k, v in state.stop_loss_triggered.items()},
                 "stop_loss_orders": {str(k): v for k, v in state.stop_loss_orders.items()},
                 "lot_qty": {str(k): v for k, v in state.lot_qty.items()},
+                # Booking ledgers: a restart must not book a fill twice.
+                "booked_sells": {k: list(v) for k, v in state.booked_sells.items()},
+                "booked_buys": dict(state.booked_buys),
                 # Cancels awaiting their real outcome: after a restart they
                 # are the only reference to orders already off the book.
                 "unresolved_cancels": [
@@ -451,6 +454,8 @@ class RealGridBot:
             state.stop_loss_triggered = {float(k): v for k, v in data.get("stop_loss_triggered", {}).items()}
             state.stop_loss_orders = {float(k): v for k, v in data.get("stop_loss_orders", {}).items()}
             state.lot_qty = {float(k): v for k, v in data.get("lot_qty", {}).items()}
+            state.booked_sells = {str(k): tuple(v) for k, v in data.get("booked_sells", {}).items()}
+            state.booked_buys = {str(k): v for k, v in data.get("booked_buys", {}).items()}
             for oid, side, price, stop_lot in data.get("unresolved_cancels", []):
                 self._unresolved_cancels.setdefault((symbol, str(oid)), (side, price, stop_lot))
             logger.info(
@@ -907,7 +912,8 @@ class RealGridBot:
     async def _final_executed_qty(self, client, symbol: str, order_id: str):
         """Executed quantity the exchange reports after a cancel, or None."""
         status = await self._order_status(client, symbol, order_id)
-        if status is None:
+        # A live status (stale read after the cancel) can still grow.
+        if status is None or status.get("status") not in self.FINAL_ORDER_STATUSES:
             return None
         try:
             return float(status.get("executedQty") or 0)
@@ -1083,11 +1089,13 @@ class RealGridBot:
             go_symbols = getattr(self, "_go_drain_symbols", None)
             if go_symbols is None:
                 go_symbols = self._go_drain_symbols = set()
+            run_seq_before = None
             try:
                 resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}")
                 status = resp.json()
+                run_seq_before = status.get("run_seq")
                 # A Start between the stop and this read: the Go loop may be
                 # placing orders again, so nothing drained now is final.
                 if status.get("is_active"):
@@ -1223,7 +1231,11 @@ class RealGridBot:
                 resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}")
-                if resp.json().get("is_active"):
+                after = resp.json()
+                # A run that started and stopped during the drain looks
+                # inactive both times; the run counter shows it.
+                restarted = run_seq_before is not None and after.get("run_seq") != run_seq_before
+                if after.get("is_active") or restarted:
                     logger.error("Kill: Go bot was started during the drain")
                     result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
             except Exception as e:
@@ -1559,6 +1571,14 @@ class RealGridBot:
                 continue
             if self._unresolved_cancels.pop((sym, order_id), None) is None:
                 continue
+            # The snapshot may still list it: drop it from the book and keep
+            # this sync from importing it back.
+            for p_, oid_ in list(state.active_sells.items()):
+                if oid_ == order_id:
+                    del state.active_sells[p_]
+            state.order_times.pop(order_id, None)
+            for pending in self._sync_cancel_sets:
+                pending.add(order_id)
             await self._book_cancelled_sell(state, price, order_id, executed, stop_lot)
 
     async def _sync_open_orders_pass(self, cfg: RealGridConfig, state: RealGridState, cancelled: Set[str]):

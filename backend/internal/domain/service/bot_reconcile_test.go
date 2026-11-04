@@ -373,3 +373,20 @@ func TestSymbolRowRewrittenAfterDeletion(t *testing.T) {
 		t.Fatalf("row not rewritten: %v", st.Symbols)
 	}
 }
+
+// A run that starts and stops while the kill switch drains looks inactive
+// before and after; a counter of starts tells the kill switch it happened.
+func TestStatusCountsRunsStarted(t *testing.T) {
+	s := NewBotService(&MockBotStatusRepository{}, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	before, _ := s.GetStatus(context.Background())
+	if err := s.Start(context.Background(), validGrid()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.GetStatus(context.Background())
+	if after.IsActive || after.RunSeq != before.RunSeq+1 {
+		t.Fatalf("run seq %d -> %d (active %v)", before.RunSeq, after.RunSeq, after.IsActive)
+	}
+}

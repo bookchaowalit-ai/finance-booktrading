@@ -102,6 +102,9 @@ type BotStatus struct {
 	// symbol was traded on, so orders left on another one are not missed.
 	Exchange        string   `json:"exchange,omitempty"`
 	TradedExchanges []string `json:"traded_exchanges,omitempty"`
+	// RunSeq counts runs started since the backend started; the kill switch
+	// compares it across its drain to catch a run that started and stopped.
+	RunSeq uint64 `json:"run_seq"`
 }
 
 // TradedSymbol is a symbol the bot traded and the exchange it traded it on.

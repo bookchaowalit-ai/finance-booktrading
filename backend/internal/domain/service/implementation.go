@@ -346,6 +346,7 @@ type BotServiceImpl struct {
 	// exchange manager's).
 	exchangeName   func() string
 	runJoined      chan struct{}
+	runSeq         uint64 // runs started; guarded by runningMu
 	stopPending    bool
 	stopFinalizing bool
 	startedAt      time.Time
@@ -521,6 +522,7 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.ctx, s.cancel = runCtx, cancel
 	s.isRunning = true
+	s.runSeq++
 	s.startedAt = time.Now()
 	s.positions = make(map[string]*positionInfo)
 	s.botMode = mode
@@ -948,6 +950,7 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 
 	s.runningMu.RLock()
 	status.IsActive = s.isRunning
+	status.RunSeq = s.runSeq
 	// Include trading stats if available
 	status.TotalTrades = s.botStatus.TotalTrades
 	status.TotalProfit = s.botStatus.TotalProfit
