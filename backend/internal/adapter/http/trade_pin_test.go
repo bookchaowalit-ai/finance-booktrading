@@ -133,3 +133,45 @@ func TestPlaceOrderChecksEachMarketOnce(t *testing.T) {
 		t.Fatalf("checked %d times", checks)
 	}
 }
+
+// Binance Global answers an unknown symbol with an error body that parses to
+// an empty ticker and no error, so the ticker itself must name the market.
+func TestListedMarketNeedsAMatchingPricedTicker(t *testing.T) {
+	cases := []struct {
+		name   string
+		ticker *exchange.TickerInfo
+		err    error
+		ok     bool
+	}{
+		{"listed", &exchange.TickerInfo{Symbol: "BTCUSDT", LastPrice: 100}, nil, true},
+		{"error body", &exchange.TickerInfo{}, nil, false},
+		{"other symbol", &exchange.TickerInfo{Symbol: "ETHUSDT", LastPrice: 100}, nil, false},
+		{"no price", &exchange.TickerInfo{Symbol: "BTCUSDT"}, nil, false},
+		{"nil", nil, nil, false},
+		{"error", nil, errors.New("down"), false},
+	}
+	for _, c := range cases {
+		if got := listedMarket("BTCUSDT", c.ticker, c.err) == nil; got != c.ok {
+			t.Errorf("%s: ok=%v", c.name, got)
+		}
+	}
+}
+
+// A symbol is put into the ticker URL as is: anything but a plain market
+// name is refused before any request or record.
+func TestPlaceOrderRefusesMalformedSymbol(t *testing.T) {
+	h := pinTestHandler()
+	h.marketExists = func(context.Context, config.ExchangeProvider, string) error {
+		t.Fatal("malformed symbol reached the exchange")
+		return nil
+	}
+	h.SetTradedSymbolRecorder(func(context.Context, string, string) error {
+		t.Fatal("malformed symbol recorded")
+		return nil
+	})
+	rec := httptest.NewRecorder()
+	h.PlaceOrder(rec, httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"BTCTHB&x=1","side":"BUY","quantity":1,"price":100}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+}

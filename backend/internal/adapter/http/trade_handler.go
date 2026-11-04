@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,10 +41,27 @@ func (h *TradeHandler) SetTradedSymbolRecorder(record func(ctx context.Context, 
 func NewTradeHandler(manager *exchange.ExchangeManager, db *pgxpool.Pool) *TradeHandler {
 	h := &TradeHandler{manager: manager, db: db}
 	h.marketExists = func(ctx context.Context, provider config.ExchangeProvider, symbol string) error {
-		_, err := manager.GetTickerOn(ctx, provider, symbol)
-		return err
+		ticker, err := manager.GetTickerOn(ctx, provider, symbol)
+		return listedMarket(symbol, ticker, err)
 	}
 	return h
+}
+
+// marketSymbol is a plain market name (BTCTHB, Bitkub's THB_BTC): the symbol
+// is put into exchange URLs unescaped.
+var marketSymbol = regexp.MustCompile(`^[A-Za-z0-9_]{2,30}$`)
+
+// listedMarket accepts a ticker only when it names the requested market and
+// has a price: Binance Global parses an "Invalid symbol" error body into an
+// empty ticker with no error.
+func listedMarket(symbol string, ticker *exchange.TickerInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if ticker == nil || !strings.EqualFold(ticker.Symbol, symbol) || ticker.LastPrice <= 0 {
+		return fmt.Errorf("no ticker for %s", symbol)
+	}
+	return nil
 }
 
 // RegisterRoutes registers real trade routes
@@ -94,6 +113,10 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 	// Validate
 	if req.Symbol == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol is required"})
+		return
+	}
+	if !marketSymbol.MatchString(req.Symbol) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol must be letters, digits or _"})
 		return
 	}
 	if req.Side != "BUY" && req.Side != "SELL" {
