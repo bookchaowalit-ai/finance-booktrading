@@ -362,7 +362,8 @@ func recordExchange(record func(string) error, ex string) error {
 		return nil
 	}
 	if err := record(ex); err != nil {
-		return fmt.Errorf("traded symbol not recorded, order not placed: %w", err)
+		// %v, not %w: a timeout here must not read as an unknown exchange outcome.
+		return fmt.Errorf("traded symbol not recorded, order not placed: %v", err)
 	}
 	return nil
 }
