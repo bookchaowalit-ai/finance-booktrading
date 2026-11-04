@@ -1601,11 +1601,12 @@ class RealGridBot:
     async def _retry_unresolved_sell_cancels(self, symbol: str, state: RealGridState):
         """Book cancelled SELLs whose final execution was unknown, once known.
 
-        Deferred while a BUY (or an order of unknown side) on the symbol is
-        unresolved: the kill books those BUY-first, so the SELL finds its lot.
+        A SELL that executed something waits while a BUY (or an order of
+        unknown side) on the symbol is unresolved: the kill books those
+        BUY-first, so the SELL finds its lot. A zero-fill one realizes
+        nothing and is finalized at once.
         """
-        if any(sym == symbol and side != "SELL" for (sym, _), (side, _, _) in self._unresolved_cancels.items()):
-            return
+        blocked = any(sym == symbol and side != "SELL" for (sym, _), (side, _, _) in self._unresolved_cancels.items())
         for (sym, order_id), (side, price, stop_lot) in list(self._unresolved_cancels.items()):
             if sym != symbol or side != "SELL" or price <= 0:
                 continue
@@ -1617,6 +1618,8 @@ class RealGridBot:
             try:
                 executed = float(known.get("executedQty") or 0)
             except (TypeError, ValueError):
+                continue
+            if blocked and executed > 0:
                 continue
             if self._unresolved_cancels.pop((sym, order_id), None) is None:
                 continue

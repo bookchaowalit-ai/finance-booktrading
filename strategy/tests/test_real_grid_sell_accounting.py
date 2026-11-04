@@ -1117,3 +1117,26 @@ async def test_sync_never_assumes_a_fill_for_a_sell_a_kill_cancelled(monkeypatch
     assert state.cumulative_pnl == 0
     bot._risk.record_trade_result.assert_not_called()
     assert ("BTCTHB", "12") in bot._unresolved_cancels
+
+
+@pytest.mark.asyncio
+async def test_sync_finalizes_a_zero_fill_sell_cancel_while_a_buy_is_unresolved(monkeypatch):
+    """A kill could read neither order. A later sync confirms the SELL
+    cancelled with nothing executed: it realizes nothing, so it leaves the
+    book (and its stop re-arms) without waiting for the BUY."""
+    state = _lots(p100=1.0)
+    state.stop_loss_triggered = {100.0: True}
+    state.stop_loss_orders = {100.0: 96.0}
+    state.active_sells = {96.0: "12"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={12: 0.0, 11: None})
+    bot._unresolved_cancels[("BTCTHB", "11")] = ("BUY", 90.0, None)
+    bot._unresolved_cancels[("BTCTHB", "12")] = ("SELL", 96.0, 100.0)
+    bot._verify_fill = AsyncMock(return_value="unknown")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert "12" not in state.active_sells.values()
+    assert ("BTCTHB", "12") not in bot._unresolved_cancels
+    assert ("BTCTHB", "11") in bot._unresolved_cancels
+    assert state.stop_loss_triggered[100.0] is False
+    assert state.cumulative_pnl == 0
