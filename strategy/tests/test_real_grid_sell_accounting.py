@@ -48,7 +48,10 @@ def _bot(monkeypatch, state, open_orders=(), final_executed=None, cancel_ok=True
             return _response(200, {"is_active": False})
         if url.endswith("/api/trade/order-status"):
             oid = int(params["orderId"])
-            return _response(200, {"status": "CANCELED", "executedQty": str(final_executed.get(oid, 0)), **(order_info or {}).get(oid, {})})
+            executed = final_executed.get(oid, 0)
+            if executed is None:
+                return _response(502)
+            return _response(200, {"status": "CANCELED", "executedQty": str(executed), **(order_info or {}).get(oid, {})})
         return _response(200, {"orders": list(open_orders)})
 
     bot._http = MagicMock(post=AsyncMock(side_effect=post), get=AsyncMock(side_effect=get))
@@ -432,3 +435,89 @@ async def test_cancelled_buy_lot_is_booked_before_the_journal_await(monkeypatch)
     await bot.kill()
 
     assert state.lot_qty[100.0] == pytest.approx(0.4)
+
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sell_with_unknown_execution_is_retried_by_the_kill(monkeypatch):
+    """A stale stop cancelled while order-status is down leaves the book; the
+    next kill must still look it up and re-arm the stop."""
+    state = _lots(p100=1.0)
+    state.stop_loss_triggered = {100.0: True}
+    state.stop_loss_orders = {100.0: 96.0}
+    state.active_sells = {96.0: "7"}
+    final = {7: None}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed=final)
+    state.order_times["7"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+
+    await bot._cancel_stale_orders(cfg, state, 98.0)
+    assert 96.0 not in state.active_sells
+    assert state.stop_loss_triggered[100.0] is True  # not re-armed blind
+
+    first = await bot.kill()
+    assert first["contained"] is False
+
+    final[7] = 0
+    retry = await bot.kill()
+    assert retry["contained"] is True
+    assert state.stop_loss_triggered[100.0] is False
+
+
+@pytest.mark.asyncio
+async def test_sync_retries_cancelled_sell_with_unknown_execution(monkeypatch):
+    state = _lots(p100=1.0)
+    state.stop_loss_triggered = {100.0: True}
+    state.stop_loss_orders = {100.0: 96.0}
+    state.active_sells = {96.0: "7"}
+    final = {7: None}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed=final)
+    state.order_times["7"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    await bot._cancel_stale_orders(cfg, state, 98.0)
+
+    final[7] = 0.4
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty[100.0] == pytest.approx(0.6)
+    assert state.stop_loss_triggered[100.0] is False
+    assert ("BTCTHB", "7") not in bot._unresolved_cancels
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tracked_buy_adds_to_an_open_lot(monkeypatch):
+    state = RealGridState(
+        symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"},
+        filled_buy_prices={100.0: 0}, buy_fill_prices={100.0: time.time()},
+    )
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 11, "side": "BUY", "price": "100"}], final_executed={11: 0.2})
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+async def test_untracked_and_tracked_buy_fills_at_one_price_add_up(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    snapshot = [{"orderId": 99, "side": "BUY", "price": "100"}, {"orderId": 11, "side": "BUY", "price": "100"}]
+    bot, _, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={99: 0.3, 11: 0.4})
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
+async def test_missing_side_is_resolved_before_buys_are_booked_first(monkeypatch):
+    """An untracked BUY whose side only the exchange knows is still booked
+    before the SELL listed ahead of it (0.3 bought, 0.2 sold leaves 0.1)."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    snapshot = [{"orderId": 98, "side": "SELL", "price": "110"}, {"orderId": 99}]
+    bot, _, _ = _bot(
+        monkeypatch, state, open_orders=snapshot, final_executed={98: 0.2, 99: 0.3},
+        order_info={99: {"side": "BUY", "price": "100"}},
+    )
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(0.1)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
