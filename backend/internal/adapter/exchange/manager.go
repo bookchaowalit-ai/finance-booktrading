@@ -473,10 +473,11 @@ func (m *ExchangeManager) CancelOrderByClientIDOn(ctx context.Context, provider 
 
 // GetTicker returns ticker info for a symbol from the current exchange
 func (m *ExchangeManager) GetTicker(ctx context.Context, symbol string) (*TickerInfo, error) {
-	m.mu.RLock()
-	provider := m.currentProvider
-	m.mu.RUnlock()
+	return m.GetTickerOn(ctx, m.GetCurrentProvider(), symbol)
+}
 
+// GetTickerOn returns ticker info for a symbol from the named exchange.
+func (m *ExchangeManager) GetTickerOn(ctx context.Context, provider config.ExchangeProvider, symbol string) (*TickerInfo, error) {
 	switch provider {
 	case config.ExchangeBinance:
 		return m.getBinanceTicker(ctx, symbol)

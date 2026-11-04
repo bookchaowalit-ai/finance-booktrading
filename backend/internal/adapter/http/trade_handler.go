@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"trading-bot-system/backend/internal/adapter/exchange"
@@ -22,6 +23,10 @@ type TradeHandler struct {
 	// recordTraded durably notes (symbol, exchange) before an order is
 	// placed, so the kill switch knows every exchange orders went to.
 	recordTraded func(ctx context.Context, symbol, exchange string) error
+	// marketExists checks the exchange lists the symbol before it is
+	// recorded; knownMarkets keeps the "provider|symbol" pairs it accepted.
+	marketExists func(ctx context.Context, provider config.ExchangeProvider, symbol string) error
+	knownMarkets sync.Map
 }
 
 // SetTradedSymbolRecorder makes PlaceOrder record each order's symbol and
@@ -32,7 +37,12 @@ func (h *TradeHandler) SetTradedSymbolRecorder(record func(ctx context.Context, 
 
 // NewTradeHandler creates a new trade handler
 func NewTradeHandler(manager *exchange.ExchangeManager, db *pgxpool.Pool) *TradeHandler {
-	return &TradeHandler{manager: manager, db: db}
+	h := &TradeHandler{manager: manager, db: db}
+	h.marketExists = func(ctx context.Context, provider config.ExchangeProvider, symbol string) error {
+		_, err := manager.GetTickerOn(ctx, provider, symbol)
+		return err
+	}
+	return h
 }
 
 // RegisterRoutes registers real trade routes
@@ -105,6 +115,17 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 	// The provider is read once: the order goes to the exchange recorded.
 	provider := h.manager.GetCurrentProvider()
 	if h.recordTraded != nil {
+		// A recorded symbol stays in every kill switch drain, so only a
+		// market the exchange lists is recorded.
+		key := string(provider) + "|" + req.Symbol
+		if _, known := h.knownMarkets.Load(key); !known {
+			if err := h.marketExists(r.Context(), provider, req.Symbol); err != nil {
+				logger.Error("Market not found, order not placed", "symbol", req.Symbol, "exchange", provider, "error", err)
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("symbol %s not available on %s, order not placed", req.Symbol, provider)})
+				return
+			}
+			h.knownMarkets.Store(key, true)
+		}
 		if err := h.recordTraded(r.Context(), req.Symbol, string(provider)); err != nil {
 			logger.Error("Traded symbol not recorded, order not placed", "symbol", req.Symbol, "error", err)
 			// 409, not 5xx: the order was definitely not sent.

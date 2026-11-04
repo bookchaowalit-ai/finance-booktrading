@@ -17,7 +17,10 @@ import (
 // which shows which provider a request reached.
 func pinTestHandler() *TradeHandler {
 	m := exchange.NewExchangeManager(&config.ExchangeConfig{Provider: config.ExchangeBinanceTH, APIKeys: map[string]*config.ExchangeAPIKey{}}, nil)
-	return NewTradeHandler(m, nil)
+	h := NewTradeHandler(m, nil)
+	// Every market exists: no ticker request leaves the test.
+	h.marketExists = func(context.Context, config.ExchangeProvider, string) error { return nil }
+	return h
 }
 
 func errorOf(t *testing.T, rec *httptest.ResponseRecorder) string {
@@ -89,5 +92,44 @@ func TestPlaceOrderRefusedWhenNotRecorded(t *testing.T) {
 	h.PlaceOrder(rec, httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"BTCUSDT","side":"BUY","quantity":1,"price":100}`)))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A market the exchange does not list is refused before it is recorded: the
+// kill switch drains every recorded symbol, and an unlistable one would keep
+// every later kill uncontained although no order was placed.
+func TestPlaceOrderRefusesUnknownMarketBeforeRecording(t *testing.T) {
+	h := pinTestHandler()
+	var checked []string
+	h.marketExists = func(_ context.Context, provider config.ExchangeProvider, symbol string) error {
+		checked = append(checked, symbol+"@"+string(provider))
+		return errors.New("invalid symbol")
+	}
+	recorded := 0
+	h.SetTradedSymbolRecorder(func(context.Context, string, string) error { recorded++; return nil })
+	rec := httptest.NewRecorder()
+	h.PlaceOrder(rec, httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"NOPETHB","side":"BUY","quantity":1,"price":100}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if recorded != 0 {
+		t.Fatalf("unknown market recorded %d times", recorded)
+	}
+	if len(checked) != 1 || checked[0] != "NOPETHB@binance_th" {
+		t.Fatalf("checked %v", checked)
+	}
+}
+
+// A market seen once is not looked up again for every order.
+func TestPlaceOrderChecksEachMarketOnce(t *testing.T) {
+	h := pinTestHandler()
+	checks := 0
+	h.marketExists = func(context.Context, config.ExchangeProvider, string) error { checks++; return nil }
+	h.SetTradedSymbolRecorder(func(context.Context, string, string) error { return nil })
+	for i := 0; i < 2; i++ {
+		h.PlaceOrder(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"BTCTHB","side":"BUY","quantity":1,"price":100}`)))
+	}
+	if checks != 1 {
+		t.Fatalf("checked %d times", checks)
 	}
 }
