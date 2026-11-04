@@ -396,6 +396,13 @@ class RealGridBot:
                 "stop_loss_triggered": {str(k): v for k, v in state.stop_loss_triggered.items()},
                 "stop_loss_orders": {str(k): v for k, v in state.stop_loss_orders.items()},
                 "lot_qty": {str(k): v for k, v in state.lot_qty.items()},
+                # Cancels awaiting their real outcome: after a restart they
+                # are the only reference to orders already off the book.
+                "unresolved_cancels": [
+                    [oid, side, price, stop_lot]
+                    for (sym, oid), (side, price, stop_lot) in self._unresolved_cancels.items()
+                    if sym == symbol
+                ],
             }
             await self._redis.set(f"real_grid:{symbol}:state", json.dumps(data))
         except Exception as e:
@@ -444,6 +451,8 @@ class RealGridBot:
             state.stop_loss_triggered = {float(k): v for k, v in data.get("stop_loss_triggered", {}).items()}
             state.stop_loss_orders = {float(k): v for k, v in data.get("stop_loss_orders", {}).items()}
             state.lot_qty = {float(k): v for k, v in data.get("lot_qty", {}).items()}
+            for oid, side, price, stop_lot in data.get("unresolved_cancels", []):
+                self._unresolved_cancels.setdefault((symbol, str(oid)), (side, price, stop_lot))
             logger.info(
                 "Restored state for %s from Redis: buys=%d sells=%d pnl=%.2f cum_pnl=%.2f order_size=%.6f",
                 symbol, len(state.active_buys), len(state.active_sells), state.daily_pnl,
@@ -1603,17 +1612,23 @@ class RealGridBot:
                     await self._book_cancelled_buy(cfg.symbol, state, buy_price, oid)
                     continue
                 if verdict == "unknown":
+                    if (cfg.symbol, oid) in self._unresolved_cancels:
+                        # A kill cancelled it and awaits its real outcome: no
+                        # assumed fill, keep it tracked for the retry.
+                        continue
                     logger.warning(
                         "[RealGrid %s] Could not verify BUY @ %d (order %s) — assuming filled (legacy behavior)",
                         cfg.symbol, buy_price, oid,
                     )
-                # Record buy fill price for later SELL PnL matching
-                state.buy_fill_prices[buy_price] = time.time()  # fill time — used for FIFO fallback matching
-                state.filled_buy_prices[buy_price] = 0  # SELL price unknown yet
-                # One booking ledger with the cancel paths: a retry of a cancel
-                # that failed before this fill must not add it again.
-                state.booked_buys[oid] = self._lot_quantity(state, buy_price)
-                self._unresolved_cancels.pop((cfg.symbol, oid), None)
+                # Book the fill through the shared ledger, added to any lot
+                # already open at this price (e.g. a cancelled partial BUY).
+                order_qty = state.current_order_size if state.current_order_size > 0 else cfg.order_size
+                executed = order_qty
+                if verdict == "filled":
+                    known = await self._final_executed_qty(self._http, cfg.symbol, oid)
+                    if known and known > 0:
+                        executed = known
+                self._book_buy_fill(state, buy_price, oid, executed)
                 state.orders_filled += 1
                 state.last_fill_timestamp = time.time()
                 logger.info(

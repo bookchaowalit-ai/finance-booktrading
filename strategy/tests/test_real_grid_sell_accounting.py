@@ -802,3 +802,61 @@ async def test_retry_with_unknown_status_waits_for_the_drain(monkeypatch):
     retry = await bot.kill()
     assert retry["contained"] is True
     assert state.lot_qty[100.0] == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_filled_buy_adds_to_a_partial_lot_at_its_price(monkeypatch):
+    """A 0.4 lot from a cancelled partial BUY plus a 1.0 BUY filled at the
+    same price is a 1.4 lot."""
+    state = RealGridState(
+        symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "12"},
+        filled_buy_prices={100.0: 0}, buy_fill_prices={100.0: time.time()}, lot_qty={100.0: 0.4},
+    )
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={12: 1.0}, order_info={12: {"status": "FILLED"}})
+    bot._verify_fill = AsyncMock(return_value="filled")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty[100.0] == pytest.approx(1.4)
+
+
+@pytest.mark.asyncio
+async def test_unknown_verdict_does_not_retire_a_cancel_awaiting_retry(monkeypatch):
+    """A kill cancelled the BUY but could not read it: an unverifiable sync
+    must not assume a fill and drop the retry record."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    bot, cfg, _ = _bot(monkeypatch, state)
+    bot._unresolved_cancels[("BTCTHB", "11")] = ("BUY", 100.0, None)
+    bot._verify_fill = AsyncMock(return_value="unknown")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.active_buys == {100.0: "11"}
+    assert ("BTCTHB", "11") in bot._unresolved_cancels
+    assert 100.0 not in state.filled_buy_prices
+
+
+@pytest.mark.asyncio
+async def test_unresolved_cancels_survive_a_restart(monkeypatch):
+    store = {}
+
+    class FakeRedis:
+        async def set(self, key, value):
+            store[key] = value
+
+        async def get(self, key):
+            return store.get(key)
+
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    bot._redis = FakeRedis()
+    bot._save_state = RealGridBot._save_state.__get__(bot)
+    bot._unresolved_cancels[("BTCTHB", "7")] = ("SELL", 96.0, 100.0)
+    await bot._save_state("BTCTHB")
+
+    restarted = RealGridBot(configs=[RealGridConfig(symbol="BTCTHB")])
+    restarted._redis = FakeRedis()
+    restarted.states["BTCTHB"] = RealGridState(symbol="BTCTHB")
+    assert await restarted._load_state("BTCTHB")
+
+    assert restarted._unresolved_cancels == {("BTCTHB", "7"): ("SELL", 96.0, 100.0)}
