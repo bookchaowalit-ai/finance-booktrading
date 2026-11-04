@@ -115,8 +115,10 @@ type TradedSymbol struct {
 
 // UnresolvedOrder is an order submission with an unknown outcome.
 type UnresolvedOrder struct {
-	Symbol        string `json:"symbol"`
-	ClientOrderID string `json:"client_order_id"`
+	Symbol        string    `json:"symbol"`
+	ClientOrderID string    `json:"client_order_id"`
+	Exchange      string    `json:"exchange,omitempty"`
+	SubmittedAt   time.Time `json:"submitted_at"`
 }
 
 // OrderRequest represents an incoming order request

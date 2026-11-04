@@ -1140,3 +1140,24 @@ async def test_sync_finalizes_a_zero_fill_sell_cancel_while_a_buy_is_unresolved(
     assert ("BTCTHB", "11") in bot._unresolved_cancels
     assert state.stop_loss_triggered[100.0] is False
     assert state.cumulative_pnl == 0
+
+
+@pytest.mark.asyncio
+async def test_uncertain_submission_survives_a_restart(monkeypatch):
+    """A POST with an unknown outcome may still go live: a kill right after
+    a strategy restart must keep waiting it out, not report contained."""
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    store = {}
+    bot._redis = _FakeRedis(store)
+    bot._save_state = RealGridBot._save_state.__get__(bot)
+    await bot._note_uncertain_submission("BTCTHB", "BUY", 99.0, "timeout")
+
+    restarted, _, _ = _bot(monkeypatch, RealGridState(symbol="BTCTHB", current_order_size=1.0))
+    restarted._redis = _FakeRedis(store)
+    assert await restarted._load_state("BTCTHB")
+    assert await restarted._load_state("BTCTHB")  # a second load does not duplicate it
+    assert [(u["symbol"], u["side"], u["price"]) for u in restarted._uncertain_submissions] == [("BTCTHB", "BUY", 99.0)]
+
+    result = await restarted.kill()
+    assert result["contained"] is False and result["uncertain"]

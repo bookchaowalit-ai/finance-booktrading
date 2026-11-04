@@ -46,6 +46,16 @@ type TradedSymbolStore interface {
 	ListTradedSymbols(ctx context.Context) ([]model.TradedSymbol, error)
 }
 
+// UnresolvedOrderStore persists Go bot submissions until their outcome is
+// known, so an order that may still go live survives a backend restart. A
+// bot status repository may implement it.
+type UnresolvedOrderStore interface {
+	// SaveUnresolvedOrder inserts or updates the order by client order ID.
+	SaveUnresolvedOrder(ctx context.Context, order model.UnresolvedOrder) error
+	DeleteUnresolvedOrder(ctx context.Context, clientOrderID string) error
+	ListUnresolvedOrders(ctx context.Context) ([]model.UnresolvedOrder, error)
+}
+
 // MarketDataRepository defines the interface for market data caching
 type MarketDataRepository interface {
 	GetLatest(ctx context.Context, symbol model.TradeSymbol) (*model.MarketData, error)

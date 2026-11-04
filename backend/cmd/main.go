@@ -431,6 +431,7 @@ func main() {
 
 	// Register real trade routes
 	tradeHandler := httpadapter.NewTradeHandler(exchangeManager, db.Pool)
+	tradeHandler.SetTradedSymbolRecorder(botService.RecordTradedSymbol)
 	tradeHandler.RegisterRoutes(router.Mux())
 
 	// Register DCA bot routes

@@ -1,7 +1,9 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,5 +62,32 @@ func TestTradeRequestRejectsUnknownExchange(t *testing.T) {
 	pinTestHandler().GetOpenOrders(rec, httptest.NewRequest(http.MethodGet, "/api/trade/open-orders?symbol=BTCTHB&exchange=nope", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+// Trade-API orders (the strategy's grid) record their symbol and exchange
+// before they are sent, so the kill switch sees every exchange used.
+func TestPlaceOrderRecordsItsExchangeFirst(t *testing.T) {
+	h := pinTestHandler()
+	var recorded []string
+	h.SetTradedSymbolRecorder(func(ctx context.Context, symbol, exchange string) error {
+		recorded = append(recorded, symbol+"@"+exchange)
+		return nil
+	})
+	rec := httptest.NewRecorder()
+	h.PlaceOrder(rec, httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"BTCUSDT","side":"BUY","quantity":1,"price":100}`)))
+	if len(recorded) != 1 || recorded[0] != "BTCUSDT@binance_th" {
+		t.Fatalf("recorded %v", recorded)
+	}
+}
+
+// No record, no order, and a definite (non-5xx) refusal.
+func TestPlaceOrderRefusedWhenNotRecorded(t *testing.T) {
+	h := pinTestHandler()
+	h.SetTradedSymbolRecorder(func(context.Context, string, string) error { return errors.New("db down") })
+	rec := httptest.NewRecorder()
+	h.PlaceOrder(rec, httptest.NewRequest(http.MethodPost, "/api/trade/order", strings.NewReader(`{"symbol":"BTCUSDT","side":"BUY","quantity":1,"price":100}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 }

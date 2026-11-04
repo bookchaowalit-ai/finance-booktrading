@@ -169,8 +169,20 @@ func (s *BotServiceImpl) gridStep(ctx context.Context, grid gridParams, book *gr
 		price:         currentPrice,
 		submittedAt:   book.now(),
 	}
+	if err := s.noteSubmission(ctx, symbol, order); err != nil {
+		logger.Warn("Grid order not placed", "symbol", symbol, "side", side, "error", err)
+		s.broadcaster.BroadcastBotActivity(&model.BotActivity{
+			Timestamp: time.Now(),
+			Activity:  "ORDER_FAILED",
+			Symbol:    symbol,
+			Message:   fmt.Sprintf("Grid %s %.4f @ %.2f not placed: %v", side, quantity, currentPrice, err),
+			Level:     "error",
+		})
+		return ""
+	}
 	report, orderErr := ex.place(ctx, clientOrderID, side, quantity, currentPrice)
 	order.provider = report.provider
+	s.settleSubmission(symbol, order, orderErr != nil && exchange.IsOrderStateUnknown(orderErr))
 	if orderErr != nil {
 		if exchange.IsOrderStateUnknown(orderErr) {
 			// The exchange may have accepted it: never re-send blindly.
@@ -225,7 +237,11 @@ func (s *BotServiceImpl) reconcileGridOrder(ctx context.Context, grid gridParams
 		})
 		return ""
 	}
+	wasUnknown := order.unknown
 	filled := s.applyGridReport(grid, book, order, report)
+	if wasUnknown && (book.pending != order || !order.unknown) {
+		s.settleSubmission(grid.symbol, order, false)
+	}
 	if book.pending == order && report.state == gridOrderOpen {
 		s.cancelStaleGridOrder(ctx, grid, book, order, ex)
 	}

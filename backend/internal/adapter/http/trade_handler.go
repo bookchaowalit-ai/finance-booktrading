@@ -19,6 +19,15 @@ import (
 type TradeHandler struct {
 	manager *exchange.ExchangeManager
 	db      *pgxpool.Pool
+	// recordTraded durably notes (symbol, exchange) before an order is
+	// placed, so the kill switch knows every exchange orders went to.
+	recordTraded func(ctx context.Context, symbol, exchange string) error
+}
+
+// SetTradedSymbolRecorder makes PlaceOrder record each order's symbol and
+// exchange first; an order whose record fails is not placed.
+func (h *TradeHandler) SetTradedSymbolRecorder(record func(ctx context.Context, symbol, exchange string) error) {
+	h.recordTraded = record
 }
 
 // NewTradeHandler creates a new trade handler
@@ -93,7 +102,17 @@ func (h *TradeHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		"price", req.Price,
 	)
 
-	result, err := h.manager.PlaceOrder(r.Context(), req.Symbol, req.Side, req.Quantity, req.Price)
+	// The provider is read once: the order goes to the exchange recorded.
+	provider := h.manager.GetCurrentProvider()
+	if h.recordTraded != nil {
+		if err := h.recordTraded(r.Context(), req.Symbol, string(provider)); err != nil {
+			logger.Error("Traded symbol not recorded, order not placed", "symbol", req.Symbol, "error", err)
+			// 409, not 5xx: the order was definitely not sent.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "traded symbol not recorded, order not placed"})
+			return
+		}
+	}
+	result, err := h.manager.PlaceOrderOn(r.Context(), provider, req.Symbol, req.Side, req.Quantity, req.Price)
 	if err != nil {
 		logger.Error("Real trade order failed", "error", err)
 		writeJSON(w, placeOrderErrorStatus(err), map[string]string{
