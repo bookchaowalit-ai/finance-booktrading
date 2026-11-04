@@ -23,7 +23,7 @@ def _net(sell, pieces):
     return sum((sell - b) * q - b * q * FEE - sell * q * FEE for b, q in pieces)
 
 
-def _bot(monkeypatch, state, open_orders=(), final_executed=None, cancel_ok=True):
+def _bot(monkeypatch, state, open_orders=(), final_executed=None, cancel_ok=True, order_info=None):
     cfg = RealGridConfig(symbol="BTCTHB", order_size=1.0, buy_only=False, stop_loss_pct=3.0)
     bot = RealGridBot(configs=[cfg])
     bot.states = {"BTCTHB": state}
@@ -47,7 +47,8 @@ def _bot(monkeypatch, state, open_orders=(), final_executed=None, cancel_ok=True
         if url.endswith("/api/bot/status"):
             return _response(200, {"is_active": False})
         if url.endswith("/api/trade/order-status"):
-            return _response(200, {"status": "CANCELED", "executedQty": str(final_executed.get(int(params["orderId"]), 0))})
+            oid = int(params["orderId"])
+            return _response(200, {"status": "CANCELED", "executedQty": str(final_executed.get(oid, 0)), **(order_info or {}).get(oid, {})})
         return _response(200, {"orders": list(open_orders)})
 
     bot._http = MagicMock(post=AsyncMock(side_effect=post), get=AsyncMock(side_effect=get))
@@ -390,3 +391,44 @@ def test_finished_sync_removes_its_own_cancel_set():
     bot._end_sync_tracking(second)
     second.add("x")
     assert bot._sync_cancel_sets == [first] and bot._sync_cancel_sets[0] is first
+
+
+
+@pytest.mark.asyncio
+async def test_unbookable_untracked_fill_stays_unreconciled_until_booked(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    info = {}
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 97}], final_executed={97: 0.1}, order_info=info)
+
+    assert (await bot.kill())["contained"] is False
+    # The order is off the book now; a retry must still not report contained.
+    get = bot._http.get.side_effect
+
+    async def no_open_orders(url, params=None):
+        if url.endswith("/api/trade/open-orders"):
+            return _response(200, {"orders": []})
+        return await get(url, params=params)
+
+    bot._http.get.side_effect = no_open_orders
+    assert (await bot.kill())["contained"] is False
+
+    # Once the exchange reports side and price, the fill is booked.
+    info[97] = {"side": "BUY", "price": "100"}
+    assert (await bot.kill())["contained"] is True
+    assert state.lot_qty[100.0] == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_buy_lot_is_booked_before_the_journal_await(monkeypatch):
+    """A restart sync running while the journal write awaits may drop the
+    order from active_buys; the lot must already exist by then."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 11, "side": "BUY", "price": "100"}], final_executed={11: 0.4})
+
+    async def journal_exit(*args):
+        state.active_buys.clear()  # the overlapping sync
+
+    bot._journal.record_exit = AsyncMock(side_effect=journal_exit)
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(0.4)

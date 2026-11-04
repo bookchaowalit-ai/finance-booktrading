@@ -878,14 +878,31 @@ class RealGridBot:
             self._unresolved_cancels[(symbol, order_id)] = (side, price)
         return executed
 
+    async def _order_side_price(self, client, symbol: str, order_id: str) -> tuple:
+        """(side, price) the exchange reports for an order, or ("", 0.0)."""
+        client = client or self._http
+        try:
+            resp = await client.get(
+                f"{BACKEND_API_BASE}/api/trade/order-status",
+                params={"symbol": symbol, "orderId": order_id},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return (data.get("side") or "").upper(), float(data.get("price") or 0)
+        except Exception as e:
+            logger.warning("Kill: order details for %s %s failed: %s", symbol, order_id, e)
+        return "", 0.0
+
     async def _book_kill_cancel(
-        self, result: Dict, symbol: str, order_id: str, side: str, executed: float, price: float = 0.0
+        self, result: Dict, symbol: str, order_id: str, side: str, executed: float, price: float = 0.0,
+        client=None,
     ):
         """Book one order containment cancelled, from its final executed quantity.
 
         An order the bot never tracked (its POST outcome was unknown) is booked
-        from the snapshot's side and price; without them its fill cannot be
-        booked, so it is reported unreconciled.
+        from its side and price (the snapshot's, else the exchange's); without
+        them its fill cannot be booked, so it stays in _unresolved_cancels and
+        every containment re-checks it until it is booked.
         """
         oid_out = int(order_id) if order_id.isdigit() else order_id
         if executed > 0:
@@ -901,6 +918,8 @@ class RealGridBot:
                 logger.warning("Journal exit (kill cancel) failed: %s", e)
 
         if state and executed > 0 and buy_price is None and not tracked_sell:
+            if side not in ("BUY", "SELL") or price <= 0:
+                side, price = await self._order_side_price(client, symbol, order_id)
             if side == "BUY" and price > 0:
                 # The fill opened a position: keep it as a protected lot.
                 # An open lot at that price keeps its size (recorded, or the
@@ -915,15 +934,18 @@ class RealGridBot:
             else:
                 logger.error("Kill: untracked order %s %s filled %s but side/price unknown", symbol, order_id, executed)
                 result["unreconciled"].append({"symbol": symbol, "orderId": oid_out})
+                self._unresolved_cancels[(symbol, order_id)] = ("", 0.0)
             return
+        # Local state first: the journal write awaits, and a sync running
+        # meanwhile must find the lot already booked.
+        if state:
+            await self._forget_cancelled_order(state, order_id, executed)
         if executed <= 0 and not tracked_sell:
             # A tracked SELL's entry is closed by _book_cancelled_sell.
             await journal(0.0, "CANCELLED")
         elif executed > 0 and buy_price is not None:
             # The cancelled BUY's lifecycle ends; its fill stays as a lot.
             await journal(buy_price, "FILLED_BUY")
-        if state:
-            await self._forget_cancelled_order(state, order_id, executed)
 
     async def contain(self) -> Dict:
         """Stop the Go bot loop, then cancel every open exchange order.
@@ -1055,7 +1077,7 @@ class RealGridBot:
                     return side == "BUY" or bool(state and order_id in state.active_buys.values())
 
                 for item in sorted(executions, key=lambda item: not is_buy(item)):
-                    await self._book_kill_cancel(result, *item)
+                    await self._book_kill_cancel(result, *item, client=client)
                 for symbol in symbols:
                     if symbol in self.states:
                         await self._save_state(symbol)
