@@ -1741,6 +1741,10 @@ class RealGridBot:
             for sell_price, oid in filled_sell_prices:
                 if state.active_sells.get(sell_price) != oid:
                     continue  # cancelled earlier in this pass (superseded stop)
+                if (cfg.symbol, oid) in self._unresolved_cancels:
+                    # A kill cancelled it: its real execution is booked by
+                    # the cancel retry (or the next kill), never assumed here.
+                    continue
                 # Verify against the exchange before booking profit — an
                 # externally-cancelled sell booked as a fill would fabricate PnL
                 verdict = await self._verify_fill(cfg.symbol, oid)

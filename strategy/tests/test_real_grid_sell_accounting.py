@@ -1098,3 +1098,22 @@ async def test_zero_fill_sell_is_finalized_even_while_a_buy_is_unresolved(monkey
     assert "12" not in state.active_sells.values()
     assert ("BTCTHB", "12") not in bot._unresolved_cancels
     assert {"symbol": "BTCTHB", "orderId": 12} not in result["unreconciled"]
+
+
+@pytest.mark.asyncio
+async def test_sync_never_assumes_a_fill_for_a_sell_a_kill_cancelled(monkeypatch):
+    """A kill cancelled this SELL but its execution is still unknown (or it
+    waits behind a BUY). A sync that cannot read its status either must not
+    book the whole lot as sold: the cancel retry books its real execution."""
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "12"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={12: None})
+    bot._unresolved_cancels[("BTCTHB", "12")] = ("SELL", 110.0, None)
+    bot._verify_fill = AsyncMock(return_value="unknown")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty[100.0] == pytest.approx(1.0)
+    assert state.cumulative_pnl == 0
+    bot._risk.record_trade_result.assert_not_called()
+    assert ("BTCTHB", "12") in bot._unresolved_cancels
