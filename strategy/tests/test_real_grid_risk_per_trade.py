@@ -70,3 +70,33 @@ async def test_sell_is_not_limited_by_risk_per_trade(monkeypatch):
     await bot._place_grid_order(cfg, state, "SELL", PRICE)
 
     assert spy.call_args.kwargs.get("current_balance_thb", 0.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_of_an_accumulated_lot_is_not_size_capped(monkeypatch):
+    """Three fills at one price make a 300 THB lot; its stop must still go out.
+
+    The 200 THB order-size cap bounds new exposure. A SELL only exits held
+    coins (balance-checked), so capping it would leave the lot unprotected.
+    """
+    bot, cfg, state = _bot(monkeypatch, {"THB": 500.0, "BTC": 0.00015})
+    resp = MagicMock(status_code=201)
+    resp.json.return_value = {"order": {"orderId": "9"}}
+    bot._http.post.return_value = resp
+    bot._journal = MagicMock(record_entry=AsyncMock())
+    bot._webhook = MagicMock(send_fill_alert=AsyncMock())
+    state.filled_buy_prices[PRICE] = 1
+    state.lot_qty[PRICE] = 3 * SIZE
+
+    await bot._check_stop_loss(cfg, state, 1_920_000.0)
+
+    bot._http.post.assert_awaited_once()
+    assert bot._http.post.call_args.kwargs["json"]["quantity"] == pytest.approx(3 * SIZE)
+    assert state.stop_loss_triggered.get(PRICE) is True
+
+
+def test_order_size_cap_applies_to_buys_only():
+    risk = RiskManager()
+    big = risk.config.max_order_size_thb * 2 / PRICE
+    assert risk.check_order_allowed("BTCTHB", "BUY", big, PRICE)[0] is False
+    assert risk.check_order_allowed("BTCTHB", "SELL", big, PRICE)[0] is True
