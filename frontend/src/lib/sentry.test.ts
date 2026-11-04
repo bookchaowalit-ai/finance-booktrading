@@ -79,4 +79,25 @@ describe("scrubEvent: request path and query strings", () => {
     expect(event.debug_meta?.images?.[0]?.code_file).toBe("https://example.com/chunk.js");
     expect(JSON.stringify(event)).not.toContain("private");
   });
+
+  it("strips queries from the top-level message, logentry and fingerprint of a thrown string", () => {
+    // The SDK copies a thrown string into event.message and exception.values[0].value.
+    const event = scrubEvent({
+      message: "Failed https://example.com/api?token=secret",
+      logentry: { message: "Failed %s", params: ["https://example.com/api?token=secret", 3] },
+      fingerprint: ["{{ default }}", "/page?q=private"],
+      exception: { values: [{ type: "Error at /x?private=1", value: "Failed https://example.com/api?token=secret" }] },
+    });
+    expect(event.message).toBe("Failed https://example.com/api");
+    expect(event.logentry).toEqual({ message: "Failed %s", params: ["https://example.com/api", 3] });
+    expect(event.fingerprint).toEqual(["{{ default }}", "/page"]);
+    expect(event.exception?.values?.[0]?.type).toBe("Error at /x");
+    expect(JSON.stringify(event)).not.toContain("secret");
+    expect(JSON.stringify(event)).not.toContain("private");
+  });
+
+  it("strips a query glued to a bare word with no scheme or leading slash", () => {
+    const event = scrubEvent({ message: "call api?token=secret&x=1 failed; are you sure? see item #5" });
+    expect(event.message).toBe("call api failed; are you sure? see item #5");
+  });
 });
