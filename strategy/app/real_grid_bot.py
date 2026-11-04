@@ -1101,6 +1101,7 @@ class RealGridBot:
             if go_symbols is None:
                 go_symbols = self._go_drain_symbols = set()
             run_seq_before = None
+            pinned_exchange = None
             try:
                 resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
                 if resp.status_code != 200:
@@ -1114,7 +1115,7 @@ class RealGridBot:
                     result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
                 # The drain lists and cancels on this exchange only.
                 current = status.get("exchange") or ""
-                self._drain_exchange = current or None
+                self._drain_exchange = pinned_exchange = current or None
                 for other in status.get("traded_exchanges") or []:
                     if other != current:
                         logger.error("Kill: Go traded on %s; this drain only reaches %s", other, current)
@@ -1242,7 +1243,9 @@ class RealGridBot:
 
                 for item in sorted(executions, key=lambda item: not is_buy(item)):
                     symbol, order_id, side, executed, price, stop_lot = item
-                    if side == "SELL" and not is_buy(item) and blocked(symbol):
+                    # A SELL that executed nothing realizes nothing: it is
+                    # finalized now and leaves the book.
+                    if side == "SELL" and executed > 0 and not is_buy(item) and blocked(symbol):
                         state = self.states.get(symbol)
                         if stop_lot is None and state and price > 0:
                             stop_lot = self._stop_lot_for(state, price)
@@ -1271,6 +1274,12 @@ class RealGridBot:
                 if after.get("is_active") or restarted:
                     logger.error("Kill: Go bot was started during the drain")
                     result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
+                # A provider switch after the first read: an in-flight Python
+                # placement may have reached the new exchange, which this
+                # pinned drain never listed.
+                if pinned_exchange and (after.get("exchange") or "") != pinned_exchange:
+                    logger.error("Kill: exchange changed from %s to %s during containment", pinned_exchange, after.get("exchange"))
+                    result["failed"].append({"symbol": None, "orderId": None, "reason": "exchange_changed", "exchange": after.get("exchange")})
             except Exception as e:
                 logger.error("Kill: Go bot status after the drain unavailable: %s", e)
                 result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})

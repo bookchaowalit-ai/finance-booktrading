@@ -1056,3 +1056,45 @@ async def test_sell_books_once_its_blocking_buy_is_booked_in_the_same_kill(monke
     assert second["contained"] is True, second
     assert state.lot_qty[100.0] == pytest.approx(0.3)
     assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
+
+
+@pytest.mark.asyncio
+async def test_kill_fails_when_the_exchange_changes_during_containment(monkeypatch):
+    """An in-flight placement may reach the newly selected exchange, which
+    the drain pinned to the first one never lists: not contained."""
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    base_get = bot._http.get.side_effect
+    reads = {"n": 0}
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            reads["n"] += 1
+            ex = "binance_th" if reads["n"] == 1 else "binance"
+            return _response(200, {"is_active": False, "exchange": ex, "traded_exchanges": ["binance_th"]})
+        return await base_get(url, params=params)
+
+    bot._http.get.side_effect = get
+    result = await bot.kill()
+
+    assert result["contained"] is False
+    assert any(f.get("reason") == "exchange_changed" for f in result["failed"])
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_sell_is_finalized_even_while_a_buy_is_unresolved(monkeypatch):
+    """A SELL cancelled with nothing executed realizes nothing, so it does not
+    wait for the BUY: it leaves the book now (a later sync must not take its
+    disappearance as a fill)."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"}, active_sells={110.0: "12"})
+    bot, _, _ = _bot(
+        monkeypatch, state,
+        open_orders=[{"orderId": 12, "side": "SELL", "price": "110"}, {"orderId": 11, "side": "BUY", "price": "100"}],
+        final_executed={11: None, 12: 0.0},
+    )
+
+    result = await bot.kill()
+
+    assert "12" not in state.active_sells.values()
+    assert ("BTCTHB", "12") not in bot._unresolved_cancels
+    assert {"symbol": "BTCTHB", "orderId": 12} not in result["unreconciled"]
