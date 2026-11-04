@@ -578,3 +578,28 @@ async def test_unknown_exchange_is_not_contained(monkeypatch):
     result = await bot.kill()
     assert result["contained"] is False
     assert any(f.get("reason") == "other_exchange" for f in result["failed"])
+
+
+@pytest.mark.asyncio
+async def test_exchange_recorded_during_the_drain_is_not_contained(monkeypatch):
+    """A Python order pinned to the old exchange can be recorded after the
+    first status read: the final read's traded exchanges count too."""
+    bot, _ = _bot(monkeypatch, exchange="binance_th", traded_exchanges=["binance_th"])
+    inner = bot._http.get.side_effect
+    reads = []
+
+    async def get(url, params=None):
+        resp = await inner(url, params)
+        if url.endswith("/api/bot/status"):
+            reads.append(url)
+            if len(reads) > 1:
+                body = resp.json()
+                body["traded_exchanges"] = ["binance", "binance_th"]
+                return _response(200, body)
+        return resp
+
+    bot._http.get = AsyncMock(side_effect=get)
+    result = await bot.kill()
+    assert len(reads) == 2
+    assert result["contained"] is False
+    assert any(f.get("reason") == "other_exchange" and f.get("exchange") == "binance" for f in result["failed"])

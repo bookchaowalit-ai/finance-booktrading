@@ -1161,3 +1161,17 @@ async def test_uncertain_submission_survives_a_restart(monkeypatch):
 
     result = await restarted.kill()
     assert result["contained"] is False and result["uncertain"]
+
+
+def test_unreadable_sell_is_sized_by_its_own_order_not_the_lot():
+    """A lot built from two BUYs holds 2x; its grid SELL sold 1x. With no
+    executed quantity from the exchange, the SELL's placed size counts."""
+    bot = RealGridBot(configs=[RealGridConfig(symbol="BTCTHB", order_size=0.0001)])
+    state = RealGridState(symbol="BTCTHB")
+    state.buy_fill_prices[2_000_000.0] = 1.0
+    state.filled_buy_prices[2_000_000.0] = 0
+    state.lot_qty[2_000_000.0] = 0.0002
+    state.sell_order_qty["12"] = 0.0001
+    assert bot._expected_sell_qty(state, 2_100_000.0, "12") == pytest.approx(0.0001)
+    # Unknown order (state from before sizes were kept): the lot, as before.
+    assert bot._expected_sell_qty(state, 2_100_000.0, "99") == pytest.approx(0.0002)
