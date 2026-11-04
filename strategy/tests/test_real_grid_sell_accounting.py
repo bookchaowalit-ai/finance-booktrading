@@ -521,3 +521,42 @@ async def test_missing_side_is_resolved_before_buys_are_booked_first(monkeypatch
 
     assert state.lot_qty[100.0] == pytest.approx(0.1)
     assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
+
+
+@pytest.mark.asyncio
+async def test_unresolved_stop_keeps_its_lot_after_check_stop_loss(monkeypatch):
+    """_check_stop_loss drops the stop mapping once the order left the book;
+    the retry must still book against the stop's own lot and re-arm it."""
+    state = _lots(p100=1.0, p120=1.0)
+    state.stop_loss_triggered = {120.0: True}
+    state.stop_loss_orders = {120.0: 110.0}
+    state.active_sells = {110.0: "7"}
+    final = {7: None}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed=final)
+    state.order_times["7"] = time.time() - bot.MAX_ORDER_AGE_SECONDS - 1
+    bot._place_grid_order = AsyncMock(return_value=False)
+
+    await bot._cancel_stale_orders(cfg, state, 112.0)
+    await bot._check_stop_loss(cfg, state, 112.0)
+    assert 120.0 not in state.stop_loss_orders  # mapping dropped meanwhile
+
+    final[7] = 0.4
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty[120.0] == pytest.approx(0.6)  # the stop's lot, at a loss
+    assert state.lot_qty[100.0] == pytest.approx(1.0)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(120.0, 0.4)]))
+    assert state.stop_loss_triggered[120.0] is False
+
+
+@pytest.mark.asyncio
+async def test_sync_books_buy_fills_before_retried_sells(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={9: 0.4})
+    bot._unresolved_cancels[("BTCTHB", "9")] = ("SELL", 110.0, None)
+    bot._verify_fill = AsyncMock(return_value="filled")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty.get(100.0, 1.0) == pytest.approx(0.6)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.4)]))
