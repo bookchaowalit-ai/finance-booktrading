@@ -62,6 +62,9 @@ const (
 type gridOrderReport struct {
 	state       gridOrderState
 	executedQty float64
+	// provider is the exchange place sent the order to, also set with an
+	// unknown-outcome error; "" means the current provider.
+	provider string
 }
 
 // gridExchange is what the grid needs from an exchange.
@@ -71,10 +74,11 @@ type gridExchange interface {
 	place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error)
 	// lookup returns the state of an order by client order ID. submittedAt
 	// bounds the search on exchanges that cannot query by client order ID.
-	lookup(ctx context.Context, clientOrderID string, submittedAt time.Time) (gridOrderReport, error)
+	// provider is the exchange the order went to ("" = current provider).
+	lookup(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) (gridOrderReport, error)
 	// cancel requests the cancellation of an open order. A nil error does
 	// not mean it is final; the next lookup tells.
-	cancel(ctx context.Context, clientOrderID string, submittedAt time.Time) error
+	cancel(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) error
 }
 
 // gridPendingOrder is an order whose outcome is not final yet.
@@ -85,6 +89,9 @@ type gridPendingOrder struct {
 	quantity      float64
 	price         float64
 	submittedAt   time.Time
+	// provider is the exchange the order went to; lookups and cancels go
+	// there even after a provider switch.
+	provider string
 	// unknown is true while the exchange has never confirmed the order.
 	unknown bool
 	// cancelRequestedAt is when the grid last asked to cancel the order.
@@ -163,6 +170,7 @@ func (s *BotServiceImpl) gridStep(ctx context.Context, grid gridParams, book *gr
 		submittedAt:   book.now(),
 	}
 	report, orderErr := ex.place(ctx, clientOrderID, side, quantity, currentPrice)
+	order.provider = report.provider
 	if orderErr != nil {
 		if exchange.IsOrderStateUnknown(orderErr) {
 			// The exchange may have accepted it: never re-send blindly.
@@ -201,7 +209,7 @@ func (s *BotServiceImpl) reconcileGridOrder(ctx context.Context, grid gridParams
 	if ctx.Err() != nil {
 		return ""
 	}
-	report, err := ex.lookup(ctx, order.clientOrderID, order.submittedAt)
+	report, err := ex.lookup(ctx, order.provider, order.clientOrderID, order.submittedAt)
 	if err != nil {
 		level, msg := "warning", "lookup failed, will retry"
 		if errors.Is(err, exchange.ErrReconcileUnsupported) {
@@ -236,7 +244,7 @@ func (s *BotServiceImpl) cancelStaleGridOrder(ctx context.Context, grid gridPara
 		return
 	}
 	order.cancelRequestedAt = now
-	err := ex.cancel(ctx, order.clientOrderID, order.submittedAt)
+	err := ex.cancel(ctx, order.provider, order.clientOrderID, order.submittedAt)
 	if err != nil {
 		logger.Warn("Grid stale order cancel failed", "symbol", grid.symbol, "clientOrderId", order.clientOrderID, "error", err)
 		s.broadcaster.BroadcastBotActivity(&model.BotActivity{
@@ -357,6 +365,42 @@ type providerPlacer interface {
 	PlaceOrderOn(ctx context.Context, provider config.ExchangeProvider, symbol, side string, quantity, price float64) (interface{}, error)
 }
 
+// providerOrders is the part of the exchange manager lookups and cancels need.
+type providerOrders interface {
+	GetCurrentProvider() config.ExchangeProvider
+	LookupOrderByClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, clientOrderID string, since time.Time) (*exchange.OrderReport, error)
+	CancelOrderByClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, clientOrderID string, since time.Time) error
+}
+
+// orderProvider is the provider an order went to, or the current one for an
+// order placed before providers were recorded.
+func orderProvider(p providerOrders, provider string) config.ExchangeProvider {
+	if provider == "" {
+		return p.GetCurrentProvider()
+	}
+	return config.ExchangeProvider(provider)
+}
+
+func lookupOnProvider(ctx context.Context, p providerOrders, provider, symbol, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
+	report, err := p.LookupOrderByClientIDOn(ctx, orderProvider(p, provider), symbol, clientOrderID, submittedAt)
+	if errors.Is(err, exchange.ErrOrderNotFound) {
+		return gridOrderReport{state: gridOrderNotFound}, nil
+	}
+	if err != nil {
+		return gridOrderReport{}, err
+	}
+	return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty}, nil
+}
+
+func cancelOnProvider(ctx context.Context, p providerOrders, provider, symbol, clientOrderID string, submittedAt time.Time) error {
+	err := p.CancelOrderByClientIDOn(ctx, orderProvider(p, provider), symbol, clientOrderID, submittedAt)
+	if errors.Is(err, exchange.ErrOrderNotFound) {
+		// Not open any more: the next lookup reports the final state.
+		return nil
+	}
+	return err
+}
+
 func recordExchange(record func(string) error, ex string) error {
 	if record == nil {
 		return nil
@@ -376,19 +420,20 @@ func placeOnPinnedProvider(ctx context.Context, p providerPlacer, record func(st
 	if err := recordExchange(record, string(provider)); err != nil {
 		return gridOrderReport{}, err
 	}
+	pinned := gridOrderReport{provider: string(provider)}
 	report, err := p.PlaceOrderWithClientIDOn(ctx, provider, symbol, side, quantity, price, clientOrderID)
 	if err == nil {
-		return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty}, nil
+		return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty, provider: pinned.provider}, nil
 	}
 	if !errors.Is(err, exchange.ErrReconcileUnsupported) {
-		return gridOrderReport{}, err
+		return pinned, err
 	}
 	// No client order IDs on this exchange: a success is taken as a fill
 	// (previous behavior) and an unknown outcome pauses the grid.
 	if _, err := p.PlaceOrderOn(ctx, provider, symbol, side, quantity, price); err != nil {
-		return gridOrderReport{}, err
+		return pinned, err
 	}
-	return gridOrderReport{state: gridOrderFilled, executedQty: quantity}, nil
+	return gridOrderReport{state: gridOrderFilled, executedQty: quantity, provider: pinned.provider}, nil
 }
 
 func (e *liveGridExchange) place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
@@ -404,28 +449,16 @@ func (e *liveGridExchange) place(ctx context.Context, clientOrderID, side string
 	return gridOrderReport{state: gridOrderFilled, executedQty: quantity}, nil
 }
 
-func (e *liveGridExchange) lookup(ctx context.Context, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
+func (e *liveGridExchange) lookup(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
 	if e.manager == nil {
 		return gridOrderReport{}, exchange.ErrReconcileUnsupported
 	}
-	report, err := e.manager.LookupOrderByClientIDSince(ctx, e.symbol, clientOrderID, submittedAt)
-	if errors.Is(err, exchange.ErrOrderNotFound) {
-		return gridOrderReport{state: gridOrderNotFound}, nil
-	}
-	if err != nil {
-		return gridOrderReport{}, err
-	}
-	return gridOrderReport{state: gridStateFromStatus(report.Status), executedQty: report.ExecutedQty}, nil
+	return lookupOnProvider(ctx, e.manager, provider, e.symbol, clientOrderID, submittedAt)
 }
 
-func (e *liveGridExchange) cancel(ctx context.Context, clientOrderID string, submittedAt time.Time) error {
+func (e *liveGridExchange) cancel(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) error {
 	if e.manager == nil {
 		return exchange.ErrReconcileUnsupported
 	}
-	err := e.manager.CancelOrderByClientID(ctx, e.symbol, clientOrderID, submittedAt)
-	if errors.Is(err, exchange.ErrOrderNotFound) {
-		// Not open any more: the next lookup reports the final state.
-		return nil
-	}
-	return err
+	return cancelOnProvider(ctx, e.manager, provider, e.symbol, clientOrderID, submittedAt)
 }

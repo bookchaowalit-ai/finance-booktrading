@@ -754,6 +754,7 @@ type unresolvedOrder struct {
 	symbol        string
 	clientOrderID string
 	submittedAt   time.Time
+	provider      string
 }
 
 // botStopReconcileTimeout bounds the order lookups one Stop makes.
@@ -774,7 +775,7 @@ func (s *BotServiceImpl) parkUnknownOrders(symbol string, orders ...*gridPending
 		if s.unresolved == nil {
 			s.unresolved = make(map[string]unresolvedOrder)
 		}
-		s.unresolved[o.clientOrderID] = unresolvedOrder{symbol: symbol, clientOrderID: o.clientOrderID, submittedAt: o.submittedAt}
+		s.unresolved[o.clientOrderID] = unresolvedOrder{symbol: symbol, clientOrderID: o.clientOrderID, submittedAt: o.submittedAt, provider: o.provider}
 	}
 }
 
@@ -795,7 +796,7 @@ func (s *BotServiceImpl) reconcileUnresolved() {
 	ctx, cancel := context.WithTimeout(context.Background(), botStopReconcileTimeout)
 	defer cancel()
 	for _, o := range orders {
-		report, err := s.lookupFor(o.symbol).lookup(ctx, o.clientOrderID, o.submittedAt)
+		report, err := s.lookupFor(o.symbol).lookup(ctx, o.provider, o.clientOrderID, o.submittedAt)
 		if err != nil {
 			logger.Warn("Unknown order still unresolved after stop", "symbol", o.symbol, "clientOrderId", o.clientOrderID, "error", err)
 			continue
@@ -937,6 +938,13 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	if err != nil {
 		return nil, err
 	}
+	// The run counter and run state are read before the symbols: a run that
+	// starts after this read moves the counter past the one reported, and
+	// one active or still stopping now is reported active, so a kill switch
+	// comparing counters never takes an older symbol list as complete.
+	s.runningMu.RLock()
+	seqBefore, busyBefore := s.runSeq, s.isRunning || s.stopPending
+	s.runningMu.RUnlock()
 	// Fewer symbols than were traded would let the kill switch skip live
 	// orders, so an unreadable list fails the status read.
 	symbols, exchanges, err := s.tradedSymbolList(ctx)
@@ -949,8 +957,8 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.UnresolvedOrders = s.unresolvedOrderList()
 
 	s.runningMu.RLock()
-	status.IsActive = s.isRunning
-	status.RunSeq = s.runSeq
+	status.IsActive = s.isRunning || busyBefore
+	status.RunSeq = seqBefore
 	// Include trading stats if available
 	status.TotalTrades = s.botStatus.TotalTrades
 	status.TotalProfit = s.botStatus.TotalProfit

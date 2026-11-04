@@ -340,10 +340,12 @@ class RealGridBot:
         # Order POSTs whose outcome is unknown (timeout, 5xx): the order may
         # still go live, so containment waits them out (UNCERTAIN_GRACE_SEC).
         self._uncertain_submissions: List[Dict] = []
-        # One set per running _sync_open_orders (syncs can overlap, e.g. a
-        # restart during a tick): orders cancelled meanwhile, which that
-        # sync's snapshot still lists.
-        self._sync_cancel_sets: List[Set[str]] = []
+        # One (symbol, set) per running _sync_open_orders (syncs can overlap,
+        # e.g. a restart during a tick): orders cancelled meanwhile, which
+        # that sync's snapshot still lists. Order IDs are per symbol.
+        self._sync_cancel_sets: List[tuple] = []
+        # The exchange a containment drain is pinned to (see _pin_exchange).
+        self._drain_exchange: Optional[str] = None
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -836,8 +838,7 @@ class RealGridBot:
             state.order_times.pop(oid, None)
             cancelled.add(oid)
             # A sync in progress must not re-import it from its snapshot.
-            for pending in self._sync_cancel_sets:
-                pending.add(oid)
+            self._note_sync_cancel(symbol, oid)
             await self._after_confirmed_sell_cancel(symbol, state, price, oid)
         return cancelled
 
@@ -894,6 +895,16 @@ class RealGridBot:
             await asyncio.sleep(0.01)
         return True
 
+    def _pin_exchange(self, params: Dict) -> Dict:
+        """Name the drain's exchange on a backend trade request.
+
+        While a containment runs, its lists, cancels and status reads go to
+        the exchange it read at its start, so a provider switch mid-drain
+        cannot send them to another exchange and report that one clean.
+        """
+        pinned = getattr(self, "_drain_exchange", None)
+        return {**params, "exchange": pinned} if pinned else params
+
     async def _order_status(self, client, symbol: str, order_id: str) -> Optional[Dict]:
         """The exchange's view of one order (status, executedQty, ...), or None."""
         if client is None or not hasattr(client, "get"):
@@ -901,7 +912,7 @@ class RealGridBot:
         try:
             resp = await client.get(
                 f"{BACKEND_API_BASE}/api/trade/order-status",
-                params={"symbol": symbol, "orderId": order_id},
+                params=self._pin_exchange({"symbol": symbol, "orderId": order_id}),
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -985,7 +996,7 @@ class RealGridBot:
         try:
             resp = await client.get(
                 f"{BACKEND_API_BASE}/api/trade/order-status",
-                params={"symbol": symbol, "orderId": order_id},
+                params=self._pin_exchange({"symbol": symbol, "orderId": order_id}),
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1101,8 +1112,9 @@ class RealGridBot:
                 if status.get("is_active"):
                     logger.error("Kill: Go bot is running again after the stop")
                     result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
-                # The drain lists and cancels on the current exchange only.
+                # The drain lists and cancels on this exchange only.
                 current = status.get("exchange") or ""
+                self._drain_exchange = current or None
                 for other in status.get("traded_exchanges") or []:
                     if other != current:
                         logger.error("Kill: Go traded on %s; this drain only reaches %s", other, current)
@@ -1167,7 +1179,7 @@ class RealGridBot:
                     listed_at = time.time()
                     try:
                         resp = await client.get(
-                            f"{BACKEND_API_BASE}/api/trade/open-orders", params={"symbol": symbol}
+                            f"{BACKEND_API_BASE}/api/trade/open-orders", params=self._pin_exchange({"symbol": symbol})
                         )
                         resp.raise_for_status()
                         orders = resp.json().get("orders") or []
@@ -1215,7 +1227,24 @@ class RealGridBot:
                     state = self.states.get(symbol)
                     return side == "BUY" or bool(state and order_id in state.active_buys.values())
 
+                # A SELL is realized against its lot's cost, so it waits
+                # while a BUY (or an order of unknown side) on its symbol is
+                # unresolved: booked now it would estimate a profit that the
+                # BUY, booked later, could not correct. It stays a recorded
+                # cancel; the next containment or sync books it.
+                blocked = {
+                    sym for (sym, oid), (side, _, _) in self._unresolved_cancels.items()
+                    if side != "SELL"
+                }
                 for item in sorted(executions, key=lambda item: not is_buy(item)):
+                    symbol, order_id, side, executed, price, stop_lot = item
+                    if side == "SELL" and not is_buy(item) and symbol in blocked:
+                        state = self.states.get(symbol)
+                        if stop_lot is None and state and price > 0:
+                            stop_lot = self._stop_lot_for(state, price)
+                        self._unresolved_cancels[(symbol, order_id)] = (side, price, stop_lot)
+                        result["unreconciled"].append({"symbol": symbol, "orderId": int(order_id) if order_id.isdigit() else order_id})
+                        continue
                     await self._book_kill_cancel(result, *item, client=client)
                 # Live at the re-check but not booked by the drain: it left the
                 # book in between (filled or cancelled). The next attempt books it.
@@ -1243,6 +1272,7 @@ class RealGridBot:
                 result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
         finally:
             self._containing -= 1
+            self._drain_exchange = None
             if client is not self._http:
                 await client.aclose()
 
@@ -1539,7 +1569,7 @@ class RealGridBot:
         Does NOT clear state first to prevent duplicate orders.
         """
         cancelled: Set[str] = set()
-        self._sync_cancel_sets.append(cancelled)
+        self._sync_cancel_sets.append((cfg.symbol, cancelled))
         try:
             await self._sync_open_orders_pass(cfg, state, cancelled)
         finally:
@@ -1547,7 +1577,13 @@ class RealGridBot:
 
     def _end_sync_tracking(self, cancelled: Set[str]):
         # By identity: another sync's set can compare equal (both empty).
-        self._sync_cancel_sets = [s for s in self._sync_cancel_sets if s is not cancelled]
+        self._sync_cancel_sets = [(sym, s) for sym, s in self._sync_cancel_sets if s is not cancelled]
+
+    def _note_sync_cancel(self, symbol: str, order_id: str):
+        """Keep running syncs of this symbol from re-importing a cancelled order."""
+        for sym, pending in self._sync_cancel_sets:
+            if sym == symbol:
+                pending.add(order_id)
 
     async def _retry_unresolved_sell_cancels(self, symbol: str, state: RealGridState):
         """Book cancelled SELLs whose final execution was unknown, once known.
@@ -1577,8 +1613,7 @@ class RealGridBot:
                 if oid_ == order_id:
                     del state.active_sells[p_]
             state.order_times.pop(order_id, None)
-            for pending in self._sync_cancel_sets:
-                pending.add(order_id)
+            self._note_sync_cancel(symbol, order_id)
             await self._book_cancelled_sell(state, price, order_id, executed, stop_lot)
 
     async def _sync_open_orders_pass(self, cfg: RealGridConfig, state: RealGridState, cancelled: Set[str]):
@@ -1892,7 +1927,7 @@ class RealGridBot:
         try:
             resp = await client.post(
                 f"{BACKEND_API_BASE}/api/trade/cancel-order",
-                json={"symbol": symbol, "orderId": int(order_id)},
+                json=self._pin_exchange({"symbol": symbol, "orderId": int(order_id)}),
             )
             if resp.status_code != 200:
                 logger.warning("Failed to cancel order %s: %s", order_id, resp.text)

@@ -87,6 +87,7 @@ func (s *BotServiceImpl) signalTradeStep(ctx context.Context, book *signalOrderB
 		submittedAt:   book.now(),
 	}
 	report, orderErr := ex.place(ctx, order.clientOrderID, side, quantity, currentPrice)
+	order.provider = report.provider
 	if orderErr != nil {
 		if exchange.IsOrderStateUnknown(orderErr) {
 			order.unknown = true
@@ -118,7 +119,7 @@ func (s *BotServiceImpl) signalTradeStep(ctx context.Context, book *signalOrderB
 // reconcileSignalOrder looks a pending order up and applies the answer. It
 // never submits an order. final is false while the order is still pending.
 func (s *BotServiceImpl) reconcileSignalOrder(ctx context.Context, book *signalOrderBook, symbol string, order *gridPendingOrder, ex gridExchange) (filledSide string, final bool) {
-	report, err := ex.lookup(ctx, order.clientOrderID, order.submittedAt)
+	report, err := ex.lookup(ctx, order.provider, order.clientOrderID, order.submittedAt)
 	if err != nil {
 		logger.Warn("Signal order reconciliation failed", "symbol", symbol, "clientOrderId", order.clientOrderID, "error", err)
 		s.broadcaster.BroadcastBotActivity(&model.BotActivity{
@@ -209,7 +210,7 @@ func (s *BotServiceImpl) cancelStaleSignalOrder(ctx context.Context, book *signa
 	}
 	order.cancelRequestedAt = now
 	activity, level, msg := "ORDER_CANCELING", "info", "cancel requested"
-	if err := ex.cancel(ctx, order.clientOrderID, order.submittedAt); err != nil {
+	if err := ex.cancel(ctx, order.provider, order.clientOrderID, order.submittedAt); err != nil {
 		activity, level, msg = "RECONCILING", "warning", fmt.Sprintf("cancel failed, will retry: %v", err)
 	}
 	s.broadcaster.BroadcastBotActivity(&model.BotActivity{

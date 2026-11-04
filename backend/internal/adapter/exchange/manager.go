@@ -75,6 +75,9 @@ func NewExchangeManager(cfg *config.ExchangeConfig, dbRepo *database.APIKeyRepos
 	}
 
 	// Load API keys from database and override config
+	if dbRepo == nil {
+		return manager
+	}
 	ctx := context.Background()
 	dbKeys, err := dbRepo.GetAllAPIKeys(ctx)
 	if err == nil && len(dbKeys) > 0 {
@@ -403,8 +406,13 @@ func (m *ExchangeManager) LookupOrderByClientID(ctx context.Context, symbol, cli
 // order ID, so it scans open orders and the fills made since then (see
 // bitkub.FindOrderByClientID); a zero since makes absence unprovable there.
 func (m *ExchangeManager) LookupOrderByClientIDSince(ctx context.Context, symbol, clientOrderID string, since time.Time) (*OrderReport, error) {
+	return m.LookupOrderByClientIDOn(ctx, m.GetCurrentProvider(), symbol, clientOrderID, since)
+}
+
+// LookupOrderByClientIDOn is LookupOrderByClientIDSince on the given provider:
+// an order is looked up where it was placed, whatever the current provider.
+func (m *ExchangeManager) LookupOrderByClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, clientOrderID string, since time.Time) (*OrderReport, error) {
 	m.mu.RLock()
-	provider := m.currentProvider
 	executor := m.binanceExecutor
 	thAdapter := m.binanceTHAdapter
 	bk := m.bitkubClient
@@ -437,8 +445,12 @@ func (m *ExchangeManager) LookupOrderByClientIDSince(ctx context.Context, symbol
 // look it up to learn its final state. since is the submission time, used
 // by Bitkub to find the order (see LookupOrderByClientIDSince).
 func (m *ExchangeManager) CancelOrderByClientID(ctx context.Context, symbol, clientOrderID string, since time.Time) error {
+	return m.CancelOrderByClientIDOn(ctx, m.GetCurrentProvider(), symbol, clientOrderID, since)
+}
+
+// CancelOrderByClientIDOn is CancelOrderByClientID on the given provider.
+func (m *ExchangeManager) CancelOrderByClientIDOn(ctx context.Context, provider config.ExchangeProvider, symbol, clientOrderID string, since time.Time) error {
 	m.mu.RLock()
-	provider := m.currentProvider
 	executor := m.binanceExecutor
 	thAdapter := m.binanceTHAdapter
 	bk := m.bitkubClient
@@ -603,9 +615,11 @@ func (m *ExchangeManager) placeBinanceTHOrder(ctx context.Context, symbol string
 
 // GetOpenOrders gets all open orders for the current exchange
 func (m *ExchangeManager) GetOpenOrders(ctx context.Context, symbol string) (interface{}, error) {
-	m.mu.RLock()
-	provider := m.currentProvider
-	m.mu.RUnlock()
+	return m.GetOpenOrdersOn(ctx, m.GetCurrentProvider(), symbol)
+}
+
+// GetOpenOrdersOn is GetOpenOrders on the given provider.
+func (m *ExchangeManager) GetOpenOrdersOn(ctx context.Context, provider config.ExchangeProvider, symbol string) (interface{}, error) {
 
 	switch provider {
 	case config.ExchangeBinance:
@@ -624,9 +638,11 @@ func (m *ExchangeManager) GetOpenOrders(ctx context.Context, symbol string) (int
 
 // CancelOrder cancels an order on the current exchange
 func (m *ExchangeManager) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
-	m.mu.RLock()
-	provider := m.currentProvider
-	m.mu.RUnlock()
+	return m.CancelOrderOn(ctx, m.GetCurrentProvider(), symbol, orderID)
+}
+
+// CancelOrderOn is CancelOrder on the given provider.
+func (m *ExchangeManager) CancelOrderOn(ctx context.Context, provider config.ExchangeProvider, symbol string, orderID int64) error {
 
 	switch provider {
 	case config.ExchangeBinanceTH:
@@ -641,9 +657,11 @@ func (m *ExchangeManager) CancelOrder(ctx context.Context, symbol string, orderI
 
 // GetOrderStatus queries a single order's current status on the current exchange
 func (m *ExchangeManager) GetOrderStatus(ctx context.Context, symbol string, orderID int64) (*Order, error) {
-	m.mu.RLock()
-	provider := m.currentProvider
-	m.mu.RUnlock()
+	return m.GetOrderStatusOn(ctx, m.GetCurrentProvider(), symbol, orderID)
+}
+
+// GetOrderStatusOn is GetOrderStatus on the given provider.
+func (m *ExchangeManager) GetOrderStatusOn(ctx context.Context, provider config.ExchangeProvider, symbol string, orderID int64) (*Order, error) {
 
 	switch provider {
 	case config.ExchangeBinanceTH:

@@ -21,11 +21,11 @@ func (f *fakeGridExchange) place(ctx context.Context, clientOrderID, side string
 	return gridOrderReport{state: gridOrderFilled, executedQty: quantity}, nil
 }
 
-func (f *fakeGridExchange) cancel(ctx context.Context, clientOrderID string, submittedAt time.Time) error {
+func (f *fakeGridExchange) cancel(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) error {
 	return nil
 }
 
-func (f *fakeGridExchange) lookup(ctx context.Context, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
+func (f *fakeGridExchange) lookup(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
 	return gridOrderReport{state: gridOrderNotFound}, nil
 }
 

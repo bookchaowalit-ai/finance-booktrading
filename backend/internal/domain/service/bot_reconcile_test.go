@@ -21,6 +21,7 @@ type symbolStoreRepo struct {
 	symbols map[model.TradedSymbol]bool
 	addErr  error
 	listErr error
+	onList  func() // runs while the list is being read
 }
 
 func (r *symbolStoreRepo) AddTradedSymbol(ctx context.Context, symbol, exchange string) error {
@@ -39,6 +40,9 @@ func (r *symbolStoreRepo) AddTradedSymbol(ctx context.Context, symbol, exchange 
 func (r *symbolStoreRepo) ListTradedSymbols(ctx context.Context) ([]model.TradedSymbol, error) {
 	if r.listErr != nil {
 		return nil, r.listErr
+	}
+	if r.onList != nil {
+		r.onList()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -96,19 +100,21 @@ type lookupStub struct {
 	report gridOrderReport
 	err    error
 	calls  atomic.Int32
+	on     []string
 }
 
 func (l *lookupStub) place(context.Context, string, string, float64, float64) (gridOrderReport, error) {
 	return gridOrderReport{}, errors.New("place must not be called")
 }
-func (l *lookupStub) lookup(ctx context.Context, id string, at time.Time) (gridOrderReport, error) {
+func (l *lookupStub) lookup(ctx context.Context, provider, id string, at time.Time) (gridOrderReport, error) {
 	l.calls.Add(1)
+	l.on = append(l.on, provider)
 	if ctx.Err() != nil {
 		return gridOrderReport{}, ctx.Err()
 	}
 	return l.report, l.err
 }
-func (l *lookupStub) cancel(context.Context, string, time.Time) error { return nil }
+func (l *lookupStub) cancel(context.Context, string, string, time.Time) error { return nil }
 
 func unknownOrder(id string, age time.Duration) *gridPendingOrder {
 	return &gridPendingOrder{clientOrderID: id, side: "BUY", unknown: true, submittedAt: time.Now().Add(-age)}
@@ -388,5 +394,46 @@ func TestStatusCountsRunsStarted(t *testing.T) {
 	after, _ := s.GetStatus(context.Background())
 	if after.IsActive || after.RunSeq != before.RunSeq+1 {
 		t.Fatalf("run seq %d -> %d (active %v)", before.RunSeq, after.RunSeq, after.IsActive)
+	}
+}
+
+// A run that starts (and stops) while the symbol list is being read must
+// not be hidden: the reported counter is the one from before the read, so
+// the kill switch's next status read sees it moved.
+func TestStatusRunSeqPrecedesTheSymbolRead(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	repo.onList = func() {
+		s.runningMu.Lock()
+		s.runSeq++ // a Start and Stop in between
+		s.runningMu.Unlock()
+	}
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.RunSeq != 0 {
+		t.Fatalf("reported run_seq %d, want the pre-read 0", st.RunSeq)
+	}
+}
+
+// A run active (or still stopping) when the read began is reported active,
+// even if it stopped before the read finished: its last symbols may be
+// newer than the list.
+func TestStatusActiveIfRunningWhenTheReadBegan(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.isRunning = true
+	repo.onList = func() {
+		s.runningMu.Lock()
+		s.isRunning = false
+		s.runningMu.Unlock()
+	}
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.IsActive {
+		t.Fatal("a run that was active at the start of the read must be reported active")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"trading-bot-system/backend/internal/adapter/exchange"
+	"trading-bot-system/backend/internal/config"
 	"trading-bot-system/backend/internal/logger"
 
 	"github.com/jackc/pgx/v5"
@@ -319,6 +320,23 @@ func (h *TradeHandler) persistTrade(ctx context.Context, req RealOrderRequest, r
 type CancelOrderRequest struct {
 	Symbol  string `json:"symbol"`
 	OrderID int64  `json:"orderId"`
+	// Exchange, when set, pins the cancel to that provider (see pinnedProvider).
+	Exchange string `json:"exchange,omitempty"`
+}
+
+// pinnedProvider is the provider a request names, or the current one. The
+// kill switch names the exchange it read at its start, so a provider switch
+// mid-drain cannot send its lists and cancels to another exchange.
+func (h *TradeHandler) pinnedProvider(name string) (config.ExchangeProvider, error) {
+	if name == "" {
+		return h.manager.GetCurrentProvider(), nil
+	}
+	switch p := config.ExchangeProvider(name); p {
+	case config.ExchangeBinance, config.ExchangeBinanceTH, config.ExchangeBitkub:
+		return p, nil
+	default:
+		return "", fmt.Errorf("unknown exchange %q", name)
+	}
 }
 
 // placeOrderErrorStatus maps an order error to a status: 502 when the order
@@ -343,7 +361,12 @@ func (h *TradeHandler) GetOpenOrders(w http.ResponseWriter, r *http.Request) {
 		symbol = "BTCTHB"
 	}
 
-	orders, err := h.manager.GetOpenOrders(r.Context(), symbol)
+	provider, err := h.pinnedProvider(r.URL.Query().Get("exchange"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	orders, err := h.manager.GetOpenOrdersOn(r.Context(), provider, symbol)
 	if err != nil {
 		logger.Error("Failed to get open orders", "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -378,7 +401,12 @@ func (h *TradeHandler) GetOrderStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, err := h.manager.GetOrderStatus(r.Context(), symbol, orderID)
+	provider, err := h.pinnedProvider(r.URL.Query().Get("exchange"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	order, err := h.manager.GetOrderStatusOn(r.Context(), provider, symbol, orderID)
 	if err != nil {
 		logger.Error("Failed to get order status", "error", err, "symbol", symbol, "orderId", orderID)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -406,8 +434,12 @@ func (h *TradeHandler) CancelOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.manager.CancelOrder(r.Context(), req.Symbol, req.OrderID)
+	provider, err := h.pinnedProvider(req.Exchange)
 	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.manager.CancelOrderOn(r.Context(), provider, req.Symbol, req.OrderID); err != nil {
 		logger.Error("Failed to cancel order", "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return

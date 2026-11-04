@@ -24,6 +24,9 @@ type scriptedExchange struct {
 	lookups   int
 	cancels   []string
 	cancelErr error
+	// lookupOn and cancelOn are the providers lookups and cancels named.
+	lookupOn []string
+	cancelOn []string
 }
 
 func newScriptedExchange() *scriptedExchange {
@@ -38,13 +41,14 @@ func (e *scriptedExchange) place(ctx context.Context, clientOrderID, side string
 	e.sides = append(e.sides, side)
 	if err := e.placeErr; err != nil {
 		e.placeErr = nil
-		return gridOrderReport{}, err
+		return gridOrderReport{provider: e.placeResp.provider}, err
 	}
 	return e.placeResp, nil
 }
 
-func (e *scriptedExchange) lookup(ctx context.Context, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
+func (e *scriptedExchange) lookup(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) (gridOrderReport, error) {
 	e.lookups++
+	e.lookupOn = append(e.lookupOn, provider)
 	if e.lookupErr != nil {
 		return gridOrderReport{}, e.lookupErr
 	}
@@ -54,8 +58,9 @@ func (e *scriptedExchange) lookup(ctx context.Context, clientOrderID string, sub
 	return gridOrderReport{state: gridOrderNotFound}, nil
 }
 
-func (e *scriptedExchange) cancel(ctx context.Context, clientOrderID string, submittedAt time.Time) error {
+func (e *scriptedExchange) cancel(ctx context.Context, provider, clientOrderID string, submittedAt time.Time) error {
 	e.cancels = append(e.cancels, clientOrderID)
+	e.cancelOn = append(e.cancelOn, provider)
 	return e.cancelErr
 }
 
