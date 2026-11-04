@@ -59,3 +59,14 @@ func TestOrderRefusedWhenExchangeNotRecorded(t *testing.T) {
 		t.Fatalf("order placed without a record: %v", p.placedOn)
 	}
 }
+
+// A timed-out symbol write is "not submitted", never an unknown exchange
+// outcome: that would park a pending order that does not exist.
+func TestRecordTimeoutIsNotAnUnknownOutcome(t *testing.T) {
+	p := &switchingPlacer{provider: config.ExchangeBinanceTH}
+	record := func(string) error { return context.DeadlineExceeded }
+	_, err := placeOnPinnedProvider(context.Background(), p, record, "BTCTHB", "grid-x-3", "BUY", 1, 100)
+	if err == nil || exchange.IsOrderStateUnknown(err) {
+		t.Fatalf("got %v, want a definite not-submitted error", err)
+	}
+}
