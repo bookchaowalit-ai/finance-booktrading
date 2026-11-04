@@ -390,10 +390,20 @@ def test_finished_sync_removes_its_own_cancel_set():
     """Two syncs' sets compare equal while empty; removal must be by identity."""
     bot = RealGridBot(configs=[RealGridConfig(symbol="BTCTHB")])
     first, second = set(), set()
-    bot._sync_cancel_sets = [first, second]
+    bot._sync_cancel_sets = [("BTCTHB", first), ("BTCTHB", second)]
     bot._end_sync_tracking(second)
     second.add("x")
-    assert bot._sync_cancel_sets == [first] and bot._sync_cancel_sets[0] is first
+    assert len(bot._sync_cancel_sets) == 1 and bot._sync_cancel_sets[0][1] is first
+
+
+def test_sync_cancel_is_scoped_to_its_symbol():
+    """Order IDs are per symbol: cancelling BTCTHB order 5 must not hide
+    ETHTHB's live order 5 from an overlapping ETHTHB sync."""
+    bot = RealGridBot(configs=[RealGridConfig(symbol="BTCTHB"), RealGridConfig(symbol="ETHTHB")])
+    btc, eth = set(), set()
+    bot._sync_cancel_sets = [("BTCTHB", btc), ("ETHTHB", eth)]
+    bot._note_sync_cancel("BTCTHB", "5")
+    assert btc == {"5"} and eth == set()
 
 
 
@@ -937,3 +947,196 @@ async def test_go_run_started_and_stopped_during_the_drain_is_not_contained(monk
 
     assert result["contained"] is False
     assert any(f.get("reason") == "go_running" for f in result["failed"])
+
+
+@pytest.mark.asyncio
+async def test_kill_defers_sell_while_its_buy_is_unresolved(monkeypatch):
+    """A SELL booked before its BUY would estimate PnL that the BUY, booked
+    later, cannot correct: it waits, and the next kill books both in order."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"}, active_sells={110.0: "12"})
+    final = {11: None, 12: 0.2}  # the BUY's final status is unavailable
+    bot, _, _ = _bot(
+        monkeypatch, state,
+        open_orders=[{"orderId": 12, "side": "SELL", "price": "110"}, {"orderId": 11, "side": "BUY", "price": "100"}],
+        final_executed=final,
+    )
+
+    first = await bot.kill()
+
+    assert first["contained"] is False
+    assert {"symbol": "BTCTHB", "orderId": 12} in first["unreconciled"]
+    assert state.cumulative_pnl == 0
+    bot._risk.record_trade_result.assert_not_called()
+    assert ("BTCTHB", "12") in bot._unresolved_cancels
+
+    # Both are off the book now; the BUY's execution is known.
+    final[11] = 0.5
+    bot._http.get.side_effect = _off_book(bot._http.get.side_effect)
+    second = await bot.kill()
+
+    assert second["contained"] is True
+    assert state.lot_qty[100.0] == pytest.approx(0.3)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
+
+
+def _off_book(get):
+    async def wrapped(url, params=None):
+        if url.endswith("/api/trade/open-orders"):
+            return _response(200, {"orders": []})
+        return await get(url, params=params)
+    return wrapped
+
+
+@pytest.mark.asyncio
+async def test_kill_drain_is_pinned_to_the_exchange_read_at_its_start(monkeypatch):
+    """Lists, cancels and status reads name the exchange from the first
+    status read, so a provider switch mid-drain cannot redirect them."""
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "5"}
+    bot, _, posted = _bot(monkeypatch, state, open_orders=[{"orderId": 5, "side": "SELL", "price": "110"}], final_executed={5: 0.0})
+    base_get = bot._http.get.side_effect
+    seen = []
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"is_active": False, "exchange": "binance_th", "traded_exchanges": ["binance_th"]})
+        seen.append((url, dict(params or {})))
+        return await base_get(url, params=params)
+
+    bot._http.get.side_effect = get
+    await bot.kill()
+
+    trade_gets = [p for u, p in seen if "/api/trade/" in u]
+    assert trade_gets and all(p.get("exchange") == "binance_th" for p in trade_gets)
+    cancels = [b for u, b in posted if u.endswith("/api/trade/cancel-order")]
+    assert cancels and all(b.get("exchange") == "binance_th" for b in cancels)
+    assert bot._drain_exchange is None  # outside a drain, requests are unpinned
+
+
+@pytest.mark.asyncio
+async def test_sell_books_once_its_blocking_buy_is_booked_in_the_same_kill(monkeypatch):
+    """Kill 1: the BUY's cancel fails (live), so the SELL waits. Kill 2: the
+    BUY is still live at the re-check but cancelled by the drain with a
+    known fill; once it is booked, the SELL is no longer blocked."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"}, active_sells={110.0: "12"})
+    bot, _, _ = _bot(monkeypatch, state)
+    cancelled, attempt = set(), {"n": 0}
+
+    async def post(url, json=None):
+        if url.endswith("/api/trade/cancel-order"):
+            oid = json["orderId"]
+            if oid == 11 and attempt["n"] == 1:
+                return _response(502)
+            cancelled.add(oid)
+        return _response(200)
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"is_active": False})
+        if url.endswith("/api/trade/order-status"):
+            oid = int(params["orderId"])
+            if oid not in cancelled:
+                return _response(200, {"status": "NEW", "executedQty": "0"})
+            return _response(200, {"status": "CANCELED", "executedQty": {11: "0.5", 12: "0.2"}[oid]})
+        orders = [{"orderId": 11, "side": "BUY", "price": "100"}] if 11 not in cancelled else []
+        if 12 not in cancelled:
+            orders.insert(0, {"orderId": 12, "side": "SELL", "price": "110"})
+        return _response(200, {"orders": orders})
+
+    bot._http.post.side_effect = post
+    bot._http.get.side_effect = get
+
+    attempt["n"] = 1
+    first = await bot.kill()
+    assert first["contained"] is False and state.cumulative_pnl == 0
+
+    attempt["n"] = 2
+    second = await bot.kill()
+
+    assert second["contained"] is True, second
+    assert state.lot_qty[100.0] == pytest.approx(0.3)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
+
+
+@pytest.mark.asyncio
+async def test_kill_fails_when_the_exchange_changes_during_containment(monkeypatch):
+    """An in-flight placement may reach the newly selected exchange, which
+    the drain pinned to the first one never lists: not contained."""
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    base_get = bot._http.get.side_effect
+    reads = {"n": 0}
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            reads["n"] += 1
+            ex = "binance_th" if reads["n"] == 1 else "binance"
+            return _response(200, {"is_active": False, "exchange": ex, "traded_exchanges": ["binance_th"]})
+        return await base_get(url, params=params)
+
+    bot._http.get.side_effect = get
+    result = await bot.kill()
+
+    assert result["contained"] is False
+    assert any(f.get("reason") == "exchange_changed" for f in result["failed"])
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_sell_is_finalized_even_while_a_buy_is_unresolved(monkeypatch):
+    """A SELL cancelled with nothing executed realizes nothing, so it does not
+    wait for the BUY: it leaves the book now (a later sync must not take its
+    disappearance as a fill)."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"}, active_sells={110.0: "12"})
+    bot, _, _ = _bot(
+        monkeypatch, state,
+        open_orders=[{"orderId": 12, "side": "SELL", "price": "110"}, {"orderId": 11, "side": "BUY", "price": "100"}],
+        final_executed={11: None, 12: 0.0},
+    )
+
+    result = await bot.kill()
+
+    assert "12" not in state.active_sells.values()
+    assert ("BTCTHB", "12") not in bot._unresolved_cancels
+    assert {"symbol": "BTCTHB", "orderId": 12} not in result["unreconciled"]
+
+
+@pytest.mark.asyncio
+async def test_sync_never_assumes_a_fill_for_a_sell_a_kill_cancelled(monkeypatch):
+    """A kill cancelled this SELL but its execution is still unknown (or it
+    waits behind a BUY). A sync that cannot read its status either must not
+    book the whole lot as sold: the cancel retry books its real execution."""
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "12"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={12: None})
+    bot._unresolved_cancels[("BTCTHB", "12")] = ("SELL", 110.0, None)
+    bot._verify_fill = AsyncMock(return_value="unknown")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert state.lot_qty[100.0] == pytest.approx(1.0)
+    assert state.cumulative_pnl == 0
+    bot._risk.record_trade_result.assert_not_called()
+    assert ("BTCTHB", "12") in bot._unresolved_cancels
+
+
+@pytest.mark.asyncio
+async def test_sync_finalizes_a_zero_fill_sell_cancel_while_a_buy_is_unresolved(monkeypatch):
+    """A kill could read neither order. A later sync confirms the SELL
+    cancelled with nothing executed: it realizes nothing, so it leaves the
+    book (and its stop re-arms) without waiting for the BUY."""
+    state = _lots(p100=1.0)
+    state.stop_loss_triggered = {100.0: True}
+    state.stop_loss_orders = {100.0: 96.0}
+    state.active_sells = {96.0: "12"}
+    bot, cfg, _ = _bot(monkeypatch, state, final_executed={12: 0.0, 11: None})
+    bot._unresolved_cancels[("BTCTHB", "11")] = ("BUY", 90.0, None)
+    bot._unresolved_cancels[("BTCTHB", "12")] = ("SELL", 96.0, 100.0)
+    bot._verify_fill = AsyncMock(return_value="unknown")
+
+    await bot._sync_open_orders(cfg, state)
+
+    assert "12" not in state.active_sells.values()
+    assert ("BTCTHB", "12") not in bot._unresolved_cancels
+    assert ("BTCTHB", "11") in bot._unresolved_cancels
+    assert state.stop_loss_triggered[100.0] is False
+    assert state.cumulative_pnl == 0
