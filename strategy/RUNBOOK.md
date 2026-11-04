@@ -208,6 +208,14 @@ The Go bot stores every traded symbol in `bot_traded_symbols` (migration 023),
 so a kill after a backend restart still drains them. If that table cannot be
 written, the Go bot refuses to trade.
 
+Two more `failed` reasons:
+- `go_running`: the Go bot was started again between the stop and the drain.
+  Stop it and retry the kill.
+- `other_exchange`: a symbol was traded on another exchange than the current
+  one (migration 024 records the exchange), and the drain only reaches the
+  current exchange. Cancel the orders on that exchange by hand, then delete its
+  rows: `DELETE FROM bot_traded_symbols WHERE exchange = '<exchange>';`
+
 Partly filled SELLs that a kill or stale-order cancel stops are booked like
 fills: their realized PnL reaches the daily-loss and drawdown guards and the
 journal (`PARTIAL_SELL_CANCELLED`).

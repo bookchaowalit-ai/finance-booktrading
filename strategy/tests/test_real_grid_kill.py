@@ -16,7 +16,7 @@ def _response(status, payload=None):
     return httpx.Response(status, json=payload or {}, request=httpx.Request("GET", "http://backend"))
 
 
-def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol="", go_symbols=None, status_ok=True, go_unresolved=None):
+def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go_symbol="", go_symbols=None, status_ok=True, go_unresolved=None, go_active=False, exchange="binance_th", traded_exchanges=None):
     """Bot with a fake backend; returns (bot, posted urls).
 
     ``final_executed`` maps orderId -> executedQty that order-status reports
@@ -54,8 +54,9 @@ def _bot(monkeypatch, stop_status=200, open_orders=None, final_executed=None, go
             if not status_ok:
                 return _response(502)
             return _response(200, {
-                "is_active": bool(go_symbol), "symbol": go_symbol, "symbols": go_symbols or [],
+                "is_active": go_active, "symbol": go_symbol, "symbols": go_symbols or [],
                 "unresolved_orders": go_unresolved or [],
+                "exchange": exchange, "traded_exchanges": traded_exchanges or [exchange],
             })
         if url.endswith("/api/trade/order-status"):
             oid = int(params["orderId"])
@@ -548,3 +549,31 @@ async def test_rejected_order_is_not_uncertain(monkeypatch):
     bot._http.post = AsyncMock(return_value=_response(400, {"error": "insufficient balance"}))
     await bot._place_grid_order(cfg, state, "SELL", 2_100_000.0)
     assert bot._uncertain_submissions == []
+
+
+@pytest.mark.asyncio
+async def test_go_bot_restarted_before_drain_is_not_contained(monkeypatch):
+    """A Start that lands between the stop and the status read means the Go
+    loop may be placing orders again."""
+    bot, _ = _bot(monkeypatch, go_active=True)
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert {"symbol": None, "orderId": None, "reason": "go_running"} in result["failed"]
+
+
+@pytest.mark.asyncio
+async def test_symbols_traded_on_another_exchange_are_not_contained(monkeypatch):
+    """The drain lists and cancels on the current exchange only."""
+    bot, _ = _bot(monkeypatch, exchange="binance_th", traded_exchanges=["binance", "binance_th"])
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert {"symbol": None, "orderId": None, "reason": "other_exchange", "exchange": "binance"} in result["failed"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_exchange_is_not_contained(monkeypatch):
+    """A symbol with no recorded exchange is not known to be drained."""
+    bot, _ = _bot(monkeypatch, exchange="", traded_exchanges=["unknown"])
+    result = await bot.kill()
+    assert result["contained"] is False
+    assert any(f.get("reason") == "other_exchange" for f in result["failed"])

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"trading-bot-system/backend/internal/domain/model"
 	"trading-bot-system/backend/internal/port/input"
 )
 
@@ -17,31 +18,31 @@ import (
 type symbolStoreRepo struct {
 	MockBotStatusRepository
 	mu      sync.Mutex
-	symbols map[string]bool
+	symbols map[model.TradedSymbol]bool
 	addErr  error
 	listErr error
 }
 
-func (r *symbolStoreRepo) AddTradedSymbol(ctx context.Context, symbol string) error {
+func (r *symbolStoreRepo) AddTradedSymbol(ctx context.Context, symbol, exchange string) error {
 	if r.addErr != nil {
 		return r.addErr
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.symbols == nil {
-		r.symbols = map[string]bool{}
+		r.symbols = map[model.TradedSymbol]bool{}
 	}
-	r.symbols[symbol] = true
+	r.symbols[model.TradedSymbol{Symbol: symbol, Exchange: exchange}] = true
 	return nil
 }
 
-func (r *symbolStoreRepo) ListTradedSymbols(ctx context.Context) ([]string, error) {
+func (r *symbolStoreRepo) ListTradedSymbols(ctx context.Context) ([]model.TradedSymbol, error) {
 	if r.listErr != nil {
 		return nil, r.listErr
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := []string{}
+	out := []model.TradedSymbol{}
 	for s := range r.symbols {
 		out = append(out, s)
 	}
@@ -53,7 +54,7 @@ func (r *symbolStoreRepo) ListTradedSymbols(ctx context.Context) ([]string, erro
 func TestTradedSymbolsSurviveBackendRestart(t *testing.T) {
 	repo := &symbolStoreRepo{}
 	first := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
-	if err := first.noteTradedSymbol(context.Background(), "XRPTHB"); err != nil {
+	if err := first.noteTradedSymbol(context.Background(), "XRPTHB", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -258,7 +259,7 @@ func TestStaleStopWaiterDoesNotFinalizeNextRun(t *testing.T) {
 // stallingStore never answers a write until its context ends.
 type stallingStore struct{ symbolStoreRepo }
 
-func (r *stallingStore) AddTradedSymbol(ctx context.Context, symbol string) error {
+func (r *stallingStore) AddTradedSymbol(ctx context.Context, symbol, exchange string) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -283,5 +284,92 @@ func TestStalledSymbolPersistenceIsBounded(t *testing.T) {
 	}
 	if err := s.Stop(context.Background()); !errors.Is(err, input.ErrBotNotRunning) {
 		t.Fatalf("got %v, want ErrBotNotRunning", err)
+	}
+}
+
+// The kill switch drains through the current exchange only, so status must
+// say which exchanges symbols were traded on (a provider switch would hide
+// orders left on the old one).
+func TestStatusReportsExchangesSymbolsWereTradedOn(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	before := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	before.exchangeName = func() string { return "binance" }
+	if err := before.noteTradedSymbol(context.Background(), "BTCUSDT", before.currentExchange()); err != nil {
+		t.Fatal(err)
+	}
+
+	after := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	after.exchangeName = func() string { return "binance_th" }
+	if err := after.noteTradedSymbol(context.Background(), "BTCUSDT", after.currentExchange()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := after.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Exchange != "binance_th" {
+		t.Fatalf("exchange %q", st.Exchange)
+	}
+	if strings.Join(st.TradedExchanges, ",") != "binance,binance_th" {
+		t.Fatalf("traded exchanges %v", st.TradedExchanges)
+	}
+	if strings.Join(st.Symbols, ",") != "BTCUSDT" {
+		t.Fatalf("symbols %v", st.Symbols)
+	}
+}
+
+// The runbook clears an old exchange by deleting its rows; the process's own
+// cache must not bring it back while a store exists.
+func TestDeletedTradedSymbolRowsLeaveTheStatus(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	if err := s.noteTradedSymbol(context.Background(), "BTCUSDT", "binance"); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	repo.symbols = nil
+	repo.mu.Unlock()
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.TradedExchanges) != 0 || len(st.Symbols) != 0 {
+		t.Fatalf("deleted rows still reported: %v %v", st.Symbols, st.TradedExchanges)
+	}
+}
+
+// A row with no exchange (recorded before migration 024, or by a bot with
+// no provider) is not known to be safe: report it as "unknown".
+func TestUnknownTradedExchangeIsReported(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	repo.AddTradedSymbol(context.Background(), "BTCTHB", "")
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(st.TradedExchanges, ",") != "unknown" {
+		t.Fatalf("got %v", st.TradedExchanges)
+	}
+}
+
+// After an operator deletes rows, the next order on that symbol must write
+// its row again, or the kill switch would not drain it.
+func TestSymbolRowRewrittenAfterDeletion(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	ctx := context.Background()
+	if err := s.noteTradedSymbol(ctx, "BTCTHB", "binance_th"); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	repo.symbols = nil
+	repo.mu.Unlock()
+	if err := s.noteTradedSymbol(ctx, "BTCTHB", "binance_th"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.GetStatus(ctx)
+	if strings.Join(st.Symbols, ",") != "BTCTHB" {
+		t.Fatalf("row not rewritten: %v", st.Symbols)
 	}
 }

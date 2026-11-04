@@ -338,6 +338,9 @@ class RealGridBot:
         # Order POSTs whose outcome is unknown (timeout, 5xx): the order may
         # still go live, so containment waits them out (UNCERTAIN_GRACE_SEC).
         self._uncertain_submissions: List[Dict] = []
+        # Orders cancelled while _sync_open_orders runs (superseded stops,
+        # possibly several calls deep); its snapshot still lists them.
+        self._sync_cancelled: Set[str] = set()
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -748,7 +751,11 @@ class RealGridBot:
         """
         stop_lot = self._stop_lot_for(state, sell_price)
         if executed_qty > 0:
-            await self._realize_sell(state, sell_price, executed_qty, order_id, "PARTIAL_SELL_CANCELLED")
+            booking = await self._realize_sell(state, sell_price, executed_qty, order_id, "PARTIAL_SELL_CANCELLED")
+            # A stop resting for a lot this sell shrank is now oversized.
+            # Containment cancels every order anyway; elsewhere cancel it here.
+            if booking and booking["stops"] and not getattr(self, "_containing", 0):
+                await self._cancel_superseded_stops(state.symbol, state, booking["stops"])
         else:
             try:
                 await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
@@ -782,6 +789,8 @@ class RealGridBot:
             state.active_sells.pop(price, None)
             state.order_times.pop(oid, None)
             cancelled.add(oid)
+            # A sync in progress must not re-import it from its snapshot.
+            self._sync_cancelled.add(oid)
             await self._after_confirmed_sell_cancel(symbol, state, price, oid)
         return cancelled
 
@@ -930,6 +939,17 @@ class RealGridBot:
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}")
                 status = resp.json()
+                # A Start between the stop and this read: the Go loop may be
+                # placing orders again, so nothing drained now is final.
+                if status.get("is_active"):
+                    logger.error("Kill: Go bot is running again after the stop")
+                    result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
+                # The drain lists and cancels on the current exchange only.
+                current = status.get("exchange") or ""
+                for other in status.get("traded_exchanges") or []:
+                    if other != current:
+                        logger.error("Kill: Go traded on %s; this drain only reaches %s", other, current)
+                        result["failed"].append({"symbol": None, "orderId": None, "reason": "other_exchange", "exchange": other})
                 for sym in [status.get("symbol") or ""] + list(status.get("symbols") or []):
                     if sym:
                         go_symbols.add(sym.upper())
@@ -1302,6 +1322,7 @@ class RealGridBot:
         Only removes orders that no longer exist on exchange (filled/cancelled).
         Does NOT clear state first to prevent duplicate orders.
         """
+        self._sync_cancelled = set()
         try:
             resp = await self._http.get(
                 f"{BACKEND_API_BASE}/api/trade/open-orders",
@@ -1398,7 +1419,6 @@ class RealGridBot:
                 state.order_times.pop(oid, None)
 
             # Detect filled SELLs
-            cancelled_this_pass: Set[str] = set()  # superseded stops; the snapshot still lists them
             filled_sell_prices = []
             for price, oid in list(state.active_sells.items()):
                 if oid not in actual_order_ids:
@@ -1463,7 +1483,7 @@ class RealGridBot:
                 )
                 del state.active_sells[sell_price]
                 state.order_times.pop(oid, None)
-                cancelled_this_pass |= await self._cancel_superseded_stops(cfg.symbol, state, booking["stops"])
+                await self._cancel_superseded_stops(cfg.symbol, state, booking["stops"])
 
             # Update fill rate
             if state.orders_placed > 0:
@@ -1483,7 +1503,7 @@ class RealGridBot:
 
                 if status not in ("NEW", "PARTIALLY_FILLED"):
                     continue
-                if price <= 0 or order_id in cancelled_this_pass:
+                if price <= 0 or order_id in self._sync_cancelled:
                     continue
 
                 if side == "BUY" and price not in state.active_buys:
@@ -1508,6 +1528,8 @@ class RealGridBot:
         changed = False
         for side, order_map in (("BUY", state.active_buys), ("SELL", state.active_sells)):
             for price, order_id in list(order_map.items()):
+                if order_map.get(price) != order_id:
+                    continue  # removed earlier in this pass (superseded stop)
                 verdict = await self._verify_fill(cfg.symbol, order_id)
                 if verdict != "cancelled":
                     continue
@@ -1553,6 +1575,8 @@ class RealGridBot:
 
         for side, book in (("BUY", state.active_buys), ("SELL", state.active_sells)):
             for price, order_id in list(book.items()):
+                if book.get(price) != order_id:
+                    continue  # removed earlier in this pass (superseded stop)
                 drift = price < lower_bound if side == "BUY" else price > upper_bound
                 if not drift and not aged(order_id):
                     continue
@@ -1593,6 +1617,8 @@ class RealGridBot:
                     cfg.symbol, price, price,
                 )
                 continue
+            if state.active_sells.get(price) != order_id:
+                continue  # removed earlier in this pass (superseded stop)
             if await self._cancel_order(cfg.symbol, order_id, close_journal=False):
                 del state.active_sells[price]
                 await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
