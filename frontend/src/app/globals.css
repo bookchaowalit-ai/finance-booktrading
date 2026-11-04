@@ -1,6 +1,25 @@
+/* ADR-0007 design floor: vendored tokens go in the base layer, so unlayered utilities (focus:outline-none,
+ * tracking, leading) win over the floor's defaults. app-theme.css holds this app's values. */
+@import "./design-floor/tokens.css" layer(base);
+@import "./app-theme.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Thai text needs body >= 1.6 line-height; preflight sets html to 1.5 and body inherits it. */
+@layer base {
+  body {
+    line-height: var(--leading-thai);
+  }
+}
+
+/* Skip link: first Tab stop on every page (FLOOR skip-link). Visible only while focused. */
+@layer components {
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:fixed focus:left-2 focus:top-2 focus:z-[60] focus:rounded-lg focus:bg-accent focus:px-4 focus:py-3 focus:text-accent-fg;
+  }
+}
 
 :root {
   --foreground-rgb: 0, 0, 0;

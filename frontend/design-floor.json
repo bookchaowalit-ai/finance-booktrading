@@ -1,0 +1,8 @@
+{
+  "floor": "1.0.0",
+  "public": true,
+  "target": { "serve": ["npm", "run", "start", "--", "-p", "4512"], "url": "http://localhost:4512", "timeoutSeconds": 120 },
+  "routes": ["/en", "/th", { "path": "/no-such-page/", "status": 404 }],
+  "widths": [320, 375, 390, 768, 1440],
+  "waivers": []
+}

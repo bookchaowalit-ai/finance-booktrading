@@ -265,6 +265,8 @@ export default function LandingPageClient({ lang }: { lang: string }) {
           {/* Mobile menu button */}
           <button
             className="md:hidden text-gray-400 hover:text-white"
+            aria-label={lang === 'th' ? 'เปิดเมนู' : 'Open menu'}
+            aria-expanded={mobileMenuOpen}
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
           >
             {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
@@ -306,6 +308,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
         )}
       </header>
 
+      <main id="main-content">
       {/* ── Hero ───────────────────────────────────────────────────────────── */}
       <section className="relative pt-32 pb-24 px-6 overflow-hidden">
         {/* Glow */}
@@ -315,7 +318,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
           <span className="inline-block bg-purple-600/20 text-purple-400 text-sm font-medium px-4 py-1.5 rounded-full border border-purple-500/30 mb-6">
             {t(lang, 'hero_badge')}
           </span>
-          <h1 className="text-5xl md:text-7xl font-extrabold leading-tight mb-4">
+          <h1 className="text-5xl md:text-7xl font-extrabold leading-snug mb-4">
             {t(lang, 'hero_title')}
             <span className="block text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-400">
               {t(lang, 'hero_title2')}
@@ -349,7 +352,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
             ].map((stat) => (
               <div key={stat.label} className="text-center">
                 <div className="text-3xl font-bold text-purple-400">{stat.value}</div>
-                <div className="text-gray-500 text-sm mt-1">{stat.label}</div>
+                <div className="text-gray-400 text-sm mt-1">{stat.label}</div>
               </div>
             ))}
           </div>
@@ -409,7 +412,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
                 className="bg-slate-800/60 border border-slate-700 rounded-xl p-4 text-center hover:border-purple-500/40 transition"
               >
                 <div className={`text-2xl font-bold ${stat.color}`}>{stat.value}</div>
-                <div className="text-gray-500 text-xs mt-1 uppercase tracking-wider">{stat.label}</div>
+                <div className="text-gray-400 text-xs mt-1 uppercase tracking-wider">{stat.label}</div>
               </div>
             ))}
           </div>
@@ -457,7 +460,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
                   <span className="bg-purple-600/20 text-purple-400 text-xs font-semibold px-3 py-1 rounded-full border border-purple-500/30">
                     {item.tag}
                   </span>
-                  <span className="text-gray-500 text-xs">{item.date}</span>
+                  <span className="text-gray-400 text-xs">{item.date}</span>
                 </div>
                 <h3 className="text-white font-semibold text-lg mb-3 leading-snug">{item.title}</h3>
                 <p className="text-gray-400 text-sm leading-relaxed">{item.desc}</p>
@@ -487,7 +490,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
                     {item.icon}
                   </div>
                   <div>
-                    <div className="text-gray-500 text-sm">{item.label}</div>
+                    <div className="text-gray-400 text-sm">{item.label}</div>
                     <div className="text-white font-medium">{item.value}</div>
                   </div>
                 </div>
@@ -500,19 +503,19 @@ export default function LandingPageClient({ lang }: { lang: string }) {
                 type="text"
                 placeholder={t(lang, 'contact_name')}
                 required
-                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 transition"
+                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500 transition"
               />
               <input
                 type="email"
                 placeholder={t(lang, 'contact_email_field')}
                 required
-                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 transition"
+                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500 transition"
               />
               <textarea
                 rows={5}
                 placeholder={t(lang, 'contact_message')}
                 required
-                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 transition resize-none"
+                className="w-full bg-slate-800 border border-slate-700 text-white placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500 transition resize-none"
               />
               <button
                 type="submit"
@@ -524,6 +527,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
           </div>
         </div>
       </section>
+      </main>
 
       {/* ── Footer ─────────────────────────────────────────────────────────── */}
       <footer className="border-t border-slate-800 py-12 px-6">
@@ -539,10 +543,10 @@ export default function LandingPageClient({ lang }: { lang: string }) {
                 {t(lang, 'footer_desc')}
               </p>
               <div className="flex gap-4 mt-4">
-                <a href="#" className="text-gray-500 hover:text-white transition">
+                <a href="#" aria-label="Twitter" className="p-2 -m-2 text-gray-400 hover:text-white transition">
                   <Twitter className="w-5 h-5" />
                 </a>
-                <a href="#" className="text-gray-500 hover:text-white transition">
+                <a href="#" aria-label="GitHub" className="p-2 -m-2 text-gray-400 hover:text-white transition">
                   <Github className="w-5 h-5" />
                 </a>
               </div>
@@ -552,10 +556,10 @@ export default function LandingPageClient({ lang }: { lang: string }) {
             <div>
               <h4 className="text-white font-semibold mb-4">{t(lang, 'footer_product')}</h4>
               <ul className="space-y-2 text-gray-400 text-sm">
-                <li><a href="#features" className="hover:text-white transition">{t(lang, 'nav_features')}</a></li>
-                <li><a href="#news" className="hover:text-white transition">{t(lang, 'nav_news')}</a></li>
+                <li><a href="#features" className="inline-flex min-h-[24px] items-center hover:text-white transition">{t(lang, 'nav_features')}</a></li>
+                <li><a href="#news" className="inline-flex min-h-[24px] items-center hover:text-white transition">{t(lang, 'nav_news')}</a></li>
                 <li>
-                  <Link href={`/${lang}/dashboard`} className="hover:text-white transition">
+                  <Link href={`/${lang}/dashboard`} className="inline-flex min-h-[24px] items-center hover:text-white transition">
                     Dashboard
                   </Link>
                 </li>
@@ -566,9 +570,9 @@ export default function LandingPageClient({ lang }: { lang: string }) {
             <div>
               <h4 className="text-white font-semibold mb-4">{t(lang, 'footer_company')}</h4>
               <ul className="space-y-2 text-gray-400 text-sm">
-                <li><a href="#contact" className="hover:text-white transition">{t(lang, 'nav_contact')}</a></li>
+                <li><a href="#contact" className="inline-flex min-h-[24px] items-center hover:text-white transition">{t(lang, 'nav_contact')}</a></li>
                 <li>
-                  <button onClick={() => setLoginOpen(true)} className="hover:text-white transition">
+                  <button onClick={() => setLoginOpen(true)} className="inline-flex min-h-[24px] items-center hover:text-white transition">
                     {t(lang, 'nav_login')}
                   </button>
                 </li>
@@ -576,7 +580,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
             </div>
           </div>
 
-          <div className="border-t border-slate-800 pt-8 text-center text-gray-500 text-sm">
+          <div className="border-t border-slate-800 pt-8 text-center text-gray-400 text-sm">
             {t(lang, 'footer_rights')}
           </div>
         </div>

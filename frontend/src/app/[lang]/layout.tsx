@@ -2,10 +2,8 @@
  * Locale Layout - Dynamic [lang] route
  */
 import { notFound } from 'next/navigation';
-import { Inter } from 'next/font/google';
+import { fontClassName } from '@/lib/fonts';
 import '../globals.css';
-
-const inter = Inter({ subsets: ['latin'] });
 
 const supportedLocales = ['en', 'th'];
 
@@ -34,9 +32,14 @@ export default async function LocaleLayout({
   }
 
   return (
-    <html lang={lang}>
+    <html lang={lang} className={fontClassName}>
       <head />
-      <body className={inter.className}>{children}</body>
+      <body>
+        <a className="skip-link" href="#main-content">
+          {lang === 'th' ? 'ข้ามไปเนื้อหาหลัก' : 'Skip to main content'}
+        </a>
+        {children}
+      </body>
     </html>
   );
 }

@@ -142,3 +142,28 @@ This system has no custom elevation tokens. No box-shadows, no ambient glows, no
 - **Don't** use `border-left` or `border-right` greater than 1px as colored stripes.
 - **Don't** use gradient text (`background-clip: text` with gradient).
 - **Don't** add uppercase tracked eyebrows above every section.
+
+## Tokens
+
+ADR-0007 design floor 1.0.0. Vendored and unchanged: `frontend/src/app/design-floor/tokens.css` (`css-vars` 1.0.0) and `frontend/src/app/design-floor/tailwind/v3.config.snippet.js` (`tailwind-v3`). This app's values are in `frontend/src/app/app-theme.css`; Tailwind maps them in `frontend/tailwind.config.js`.
+
+| Token | Value | Note |
+|---|---|---|
+| `--color-bg` | `#020617` | slate-950, page background |
+| `--color-surface` | `#0f172a` | slate-900, panels |
+| `--color-fg` | `#ffffff` | primary text |
+| `--color-fg-muted` | `#9ca3af` | secondary text, >= 4.5:1 on bg and surface |
+| `--color-accent` / `--color-accent-fg` | `#9333ea` / `#ffffff` | primary buttons, white text 5.4:1 |
+| `--color-border` | `#334155` | slate-700 |
+| `--color-focus` | `#a855f7` | focus ring colour, >= 3:1 on bg |
+| `--color-danger` / `--color-success` | `#f87171` / `#4ade80` | red-400 / green-400 |
+| `--font-sans` | Inter (Latin), then Noto Sans Thai (Thai) | `next/font` in `frontend/src/lib/fonts.ts`; Latin-first stack |
+| `--leading-thai` / `--leading-thai-heading` | 1.7 / 1.35 | every Tailwind text size uses these (body >= 1.6, headings >= 1.3) |
+| `--radius-sm` / `-md` / `-lg` | 0.125rem / 0.375rem / 0.5rem | Tailwind v3 defaults, so existing `rounded-*` are unchanged |
+| `--shadow-sm` / `-md` / `-lg` | Tailwind v3 defaults | existing `shadow-*` are unchanged |
+
+Dark mode: **yes**, class-based. The `dark` class on `<html>` (ThemeProvider and LanguageSelector) drives the existing `dark:` utilities. The vendored `:root[data-theme="dark"]` set is not applied: the snippet's `darkMode: ["selector", '[data-theme="dark"]']` would switch off those utilities, so `tailwind.config.js` keeps `darkMode: 'class'`.
+
+Waivers: none. Public routes checked: `/en`, `/th`, and the not-found page `/no-such-page/` (`frontend/design-floor.json`).
+
+Fonts: this section supersedes "No custom fonts" in section 3 and the line-height of 1.5 in section 3, which describe the app before the design floor.

@@ -78,7 +78,7 @@ export default function LanguageSelector() {
           aria-label="Select language"
         >
           <Globe className="w-5 h-5 text-gray-600 dark:text-gray-400" />
-          <span className="text-sm text-gray-700 dark:text-gray-300 hidden sm:inline">
+          <span className="text-sm text-gray-300 hidden sm:inline">
             {currentLocale?.nativeName || 'English'}
           </span>
           <ChevronDown className="w-4 h-4 text-gray-500" />

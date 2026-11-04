@@ -108,6 +108,16 @@ jobs:
       require-tests: true
       build-command: NEXT_TELEMETRY_DISABLED=1 npm run build
 
+  # ── Frontend: ADR-0007 design floor (12 rules, 5 widths) on the served build ──
+  # Public repo: GitHub-hosted runner. working-directory points the reusable job at frontend/
+  # (it reads frontend/design-floor.json and runs npm ci there).
+  design-floor:
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@df695c12bdc6822587877d5fe55d3af31d5f66db # v1.5.11
+    with:
+      working-directory: frontend
+      node-version: "24"
+      build-command: NEXT_TELEMETRY_DISABLED=1 npm run build
+
   # ── Strategy: shared CI (uv.lock, ruff, offline test suites) ──────────────────
   strategy-test:
     uses: bookchaowalit/platform-ci-workflows/.github/workflows/ci-python.yml@87dc5e1c7e0416886a6371d5a101bb2ccba38edd # v1.1.1

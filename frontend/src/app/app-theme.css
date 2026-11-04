@@ -1,0 +1,28 @@
+/*
+ * BookFinance values for the ADR-0007 tokens (src/app/design-floor/tokens.css, vendored unchanged).
+ * The landing page and the dashboard are dark-first: these values are the slate palette the app
+ * already uses, so the floor tokens do not restyle existing utilities. Radius and shadow values are
+ * Tailwind v3's own defaults, so rounded-lg and shadow-md keep their current size.
+ */
+:root {
+  --color-bg: #020617;          /* slate-950 */
+  --color-surface: #0f172a;     /* slate-900 */
+  --color-fg: #ffffff;
+  --color-fg-muted: #9ca3af;    /* gray-400: >= 4.5:1 on bg and surface */
+  --color-accent: #9333ea;      /* purple-600: primary buttons (white text 5.4:1) */
+  --color-accent-fg: #ffffff;
+  --color-border: #334155;      /* slate-700 */
+  --color-focus: #a855f7;       /* purple-500: >= 3:1 on bg */
+  --color-danger: #f87171;      /* red-400 */
+  --color-success: #4ade80;     /* green-400 */
+
+  --font-sans: var(--font-inter), var(--font-noto-sans-thai), ui-sans-serif, system-ui, sans-serif;
+
+  --radius-sm: 0.125rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
