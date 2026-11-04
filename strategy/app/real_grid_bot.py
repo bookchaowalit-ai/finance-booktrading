@@ -1056,8 +1056,13 @@ class RealGridBot:
                 executions = []
                 # Cancels from an earlier kill whose execution was unknown:
                 # they are off the book now, so only this re-check finds them.
-                for (symbol, order_id), (side, price, stop_lot) in list(self._unresolved_cancels.items()):
-                    del self._unresolved_cancels[(symbol, order_id)]
+                for (symbol, order_id) in list(self._unresolved_cancels):
+                    # Claim it: a sync running outside the tick lock (restart)
+                    # may have booked and removed it meanwhile.
+                    claimed = self._unresolved_cancels.pop((symbol, order_id), None)
+                    if claimed is None:
+                        continue
+                    side, price, stop_lot = claimed
                     executed = await self._kill_cancel_execution(client, result, symbol, order_id, side, price)
                     if executed is not None:
                         side, price = await self._resolve_side(client, symbol, order_id, side, price, executed)

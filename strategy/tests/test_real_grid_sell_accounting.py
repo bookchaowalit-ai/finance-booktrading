@@ -560,3 +560,22 @@ async def test_sync_books_buy_fills_before_retried_sells(monkeypatch):
 
     assert state.lot_qty.get(100.0, 1.0) == pytest.approx(0.6)
     assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.4)]))
+
+
+@pytest.mark.asyncio
+async def test_kill_survives_a_sync_claiming_an_unresolved_cancel(monkeypatch):
+    """A restart sync can book (and remove) an unresolved cancel while the
+    kill awaits another one; the kill must skip it, not crash."""
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    bot._unresolved_cancels[("BTCTHB", "8")] = ("SELL", 110.0, None)
+    bot._unresolved_cancels[("BTCTHB", "9")] = ("SELL", 111.0, None)
+
+    async def final_executed(client, symbol, oid):
+        bot._unresolved_cancels.pop(("BTCTHB", "9"), None)  # the overlapping sync
+        return 0.0
+
+    bot._final_executed_qty = final_executed
+    result = await bot.kill()
+
+    assert result["contained"] is True
