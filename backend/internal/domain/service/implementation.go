@@ -1097,8 +1097,9 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 
 	s.runningMu.RLock()
 	// A run that started during the read may have placed orders after a
-	// drain: report it active, keeping the pre-read counter for the list.
-	status.IsActive = s.isRunning || busyBefore || s.runSeq != seqBefore
+	// drain, and a Start still in its market lookup may begin trading after
+	// it: report both active, keeping the pre-read counter for the list.
+	status.IsActive = s.isRunning || busyBefore || s.runSeq != seqBefore || s.startsPending > 0 || s.stopPending
 	status.RunSeq = seqBefore
 	// Include trading stats if available
 	status.TotalTrades = s.botStatus.TotalTrades
