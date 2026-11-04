@@ -864,8 +864,8 @@ class RealGridBot:
             await asyncio.sleep(0.01)
         return True
 
-    async def _final_executed_qty(self, client, symbol: str, order_id: str):
-        """Executed quantity the exchange reports after a cancel, or None."""
+    async def _order_status(self, client, symbol: str, order_id: str) -> Optional[Dict]:
+        """The exchange's view of one order (status, executedQty, ...), or None."""
         if client is None or not hasattr(client, "get"):
             return None
         try:
@@ -874,10 +874,44 @@ class RealGridBot:
                 params={"symbol": symbol, "orderId": order_id},
             )
             if resp.status_code == 200:
-                return float(resp.json().get("executedQty") or 0)
+                return resp.json()
         except Exception as e:
             logger.warning("Kill: order-status for %s %s failed: %s", symbol, order_id, e)
         return None
+
+    async def _final_executed_qty(self, client, symbol: str, order_id: str):
+        """Executed quantity the exchange reports after a cancel, or None."""
+        status = await self._order_status(client, symbol, order_id)
+        if status is None:
+            return None
+        try:
+            return float(status.get("executedQty") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    async def _book_cancelled_buy(self, symbol: str, state: RealGridState, price: float, order_id: str) -> bool:
+        """Drop a BUY the exchange confirmed cancelled, keeping any fill as a lot.
+
+        False (and the order stays tracked for the next pass) when its final
+        executed quantity is unknown: dropping it would lose that fill.
+        """
+        executed = await self._final_executed_qty(self._http, symbol, order_id)
+        if executed is None:
+            logger.warning("[RealGrid %s] Cancelled BUY %s: executed qty unknown, kept for retry", symbol, order_id)
+            return False
+        if state.active_buys.get(price) == order_id:
+            del state.active_buys[price]
+        state.order_times.pop(order_id, None)
+        if executed > 0:
+            self._add_to_lot(state, price, executed)
+        try:
+            if executed > 0:
+                await self._journal.record_exit(order_id, price, "FILLED_BUY", 0.0)
+            else:
+                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+        except Exception as e:
+            logger.warning("Journal exit (cancelled BUY) failed: %s", e)
+        return True
 
     async def _kill_cancel_execution(
         self, client, result: Dict, symbol: str, order_id: str, side: str, price: float = 0.0
@@ -1063,6 +1097,11 @@ class RealGridBot:
                     if claimed is None:
                         continue
                     side, price, stop_lot = claimed
+                    known = await self._order_status(client, symbol, order_id)
+                    if known and known.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                        # Still live (an earlier cancel failed): the drain
+                        # below lists and cancels it.
+                        continue
                     executed = await self._kill_cancel_execution(client, result, symbol, order_id, side, price)
                     if executed is not None:
                         side, price = await self._resolve_side(client, symbol, order_id, side, price, executed)
@@ -1096,7 +1135,20 @@ class RealGridBot:
                         order_id = order.get("orderId")
                         if not await self._cancel_order(symbol, str(order_id), client=client, close_journal=False):
                             result["failed"].append({"symbol": symbol, "orderId": order_id})
+                            # The exchange may have cancelled it anyway (lost
+                            # response): re-check it on the next attempt.
+                            fside = order.get("side", "")
+                            try:
+                                fprice = float(order.get("price") or 0)
+                            except (TypeError, ValueError):
+                                fprice = 0.0
+                            fstate = self.states.get(symbol)
+                            fstop = self._stop_lot_for(fstate, fprice) if fstate and fside == "SELL" else None
+                            self._unresolved_cancels[(symbol, str(order_id))] = (fside, fprice, fstop)
                             continue
+                        if any(e[0] == symbol and e[1] == str(order_id) for e in executions):
+                            result["cancelled"] += 1
+                            continue  # already booked from the re-check above
                         result["cancelled"] += 1
                         side = order.get("side", "")
                         try:
@@ -1119,6 +1171,17 @@ class RealGridBot:
                     if symbol in self.states:
                         await self._save_state(symbol)
             result["uncertain"] = [dict(u) for u in self._uncertain_submissions]
+            # A Start during the drain would trade again after it: re-check.
+            try:
+                resp = await client.get(f"{BACKEND_API_BASE}/api/bot/status")
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                if resp.json().get("is_active"):
+                    logger.error("Kill: Go bot was started during the drain")
+                    result["failed"].append({"symbol": None, "orderId": None, "reason": "go_running"})
+            except Exception as e:
+                logger.error("Kill: Go bot status after the drain unavailable: %s", e)
+                result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
         finally:
             self._containing -= 1
             if client is not self._http:
@@ -1428,7 +1491,13 @@ class RealGridBot:
         self._sync_cancel_sets = [s for s in self._sync_cancel_sets if s is not cancelled]
 
     async def _retry_unresolved_sell_cancels(self, symbol: str, state: RealGridState):
-        """Book cancelled SELLs whose final execution was unknown, once known."""
+        """Book cancelled SELLs whose final execution was unknown, once known.
+
+        Deferred while a BUY (or an order of unknown side) on the symbol is
+        unresolved: the kill books those BUY-first, so the SELL finds its lot.
+        """
+        if any(sym == symbol and side != "SELL" for (sym, _), (side, _, _) in self._unresolved_cancels.items()):
+            return
         for (sym, order_id), (side, price, stop_lot) in list(self._unresolved_cancels.items()):
             if sym != symbol or side != "SELL" or price <= 0:
                 continue
@@ -1483,16 +1552,9 @@ class RealGridBot:
                 if verdict == "open":
                     continue  # open-orders snapshot raced; still on the book
                 if verdict == "cancelled":
-                    logger.info(
-                        "[RealGrid %s] BUY @ %d was cancelled externally (not filled) — no position booked",
-                        cfg.symbol, buy_price,
-                    )
-                    try:
-                        await self._journal.record_exit(oid, 0.0, "CANCELLED", 0.0)
-                    except Exception as e:
-                        logger.warning("Journal exit (external cancel) failed: %s", e)
-                    del state.active_buys[buy_price]
-                    state.order_times.pop(oid, None)
+                    # Cancelled externally; a partial fill stays as a lot.
+                    logger.info("[RealGrid %s] BUY @ %d was cancelled externally", cfg.symbol, buy_price)
+                    await self._book_cancelled_buy(cfg.symbol, state, buy_price, oid)
                     continue
                 if verdict == "unknown":
                     logger.warning(
@@ -1653,9 +1715,13 @@ class RealGridBot:
                 if verdict != "cancelled":
                     continue
 
-                del order_map[price]
-                state.order_times.pop(order_id, None)
-                if side == "SELL":
+                if side == "BUY":
+                    # Books any partial fill as a lot and closes the journal.
+                    if not await self._book_cancelled_buy(cfg.symbol, state, price, order_id):
+                        continue
+                else:
+                    del order_map[price]
+                    state.order_times.pop(order_id, None)
                     await self._after_confirmed_sell_cancel(cfg.symbol, state, price, order_id)
                 changed = True
                 logger.info(
@@ -1664,16 +1730,6 @@ class RealGridBot:
                     side,
                     price,
                 )
-                journal = getattr(self, "_journal", None)
-                if journal and side == "BUY":  # a SELL's entry is closed by its booking
-                    try:
-                        await journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
-                    except Exception as exc:
-                        logger.warning(
-                            "Journal exit (halted %s cancellation) failed: %s",
-                            side,
-                            exc,
-                        )
 
         if changed:
             await self._save_state(cfg.symbol)

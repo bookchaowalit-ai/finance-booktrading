@@ -44,6 +44,10 @@ async def test_halted_symbol_removes_only_exchange_confirmed_cancellations():
     bot.states[config.symbol] = state
     bot._http = object()
     bot._verify_fill = AsyncMock(side_effect=["cancelled", "unknown"])
+    # Nothing executed: the cancel can be booked. An unknown executed qty
+    # would keep the BUY tracked so its fill is not lost.
+    bot._final_executed_qty = AsyncMock(return_value=0.0)
+    bot._journal = MagicMock(record_exit=AsyncMock())
     bot._save_state = AsyncMock()
 
     await bot._reconcile_halted_orders(config, state)
