@@ -442,3 +442,31 @@ func TestStatusActiveIfRunningWhenTheReadBegan(t *testing.T) {
 		t.Fatal("a run that was active at the start of the read must be reported active")
 	}
 }
+
+// A Start symbol the exchange does not list is refused before it is
+// recorded: every later kill would try to drain it and fail.
+func TestStartRefusesUnlistedSymbolBeforeRecording(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.exchangeName = func() string { return "binance_th" }
+	var checked []string
+	s.marketListed = func(_ context.Context, exchange, symbol string) error {
+		checked = append(checked, symbol+"@"+exchange)
+		return errors.New("not listed")
+	}
+	params := validGrid()
+	if err := s.Start(context.Background(), params); err == nil {
+		s.Stop(context.Background())
+		t.Fatal("Start must fail for an unlisted symbol")
+	}
+	if len(checked) != 1 || checked[0] != params.Symbol+"@binance_th" {
+		t.Fatalf("checked %v", checked)
+	}
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Symbols) != 0 || st.IsActive {
+		t.Fatalf("unlisted symbol recorded or bot active: %v %v", st.Symbols, st.IsActive)
+	}
+}

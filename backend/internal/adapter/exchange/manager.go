@@ -3,6 +3,8 @@ package exchange
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 	"trading-bot-system/backend/internal/adapter/database"
@@ -474,6 +476,32 @@ func (m *ExchangeManager) CancelOrderByClientIDOn(ctx context.Context, provider 
 // GetTicker returns ticker info for a symbol from the current exchange
 func (m *ExchangeManager) GetTicker(ctx context.Context, symbol string) (*TickerInfo, error) {
 	return m.GetTickerOn(ctx, m.GetCurrentProvider(), symbol)
+}
+
+// MarketSymbol is a plain market name (BTCTHB, Bitkub's THB_BTC): symbols
+// are put into exchange URLs unescaped.
+var MarketSymbol = regexp.MustCompile(`^[A-Za-z0-9_]{2,30}$`)
+
+// ListedMarket accepts a ticker only when it names the requested market and
+// has a price: Binance Global parses an "Invalid symbol" error body into an
+// empty ticker with no error.
+func ListedMarket(symbol string, ticker *TickerInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if ticker == nil || !strings.EqualFold(ticker.Symbol, symbol) || ticker.LastPrice <= 0 {
+		return fmt.Errorf("no ticker for %s", symbol)
+	}
+	return nil
+}
+
+// MarketListed reports whether the named exchange lists symbol.
+func (m *ExchangeManager) MarketListed(ctx context.Context, provider config.ExchangeProvider, symbol string) error {
+	if !MarketSymbol.MatchString(symbol) {
+		return fmt.Errorf("malformed symbol %q", symbol)
+	}
+	ticker, err := m.GetTickerOn(ctx, provider, symbol)
+	return ListedMarket(symbol, ticker, err)
 }
 
 // GetTickerOn returns ticker info for a symbol from the named exchange.
