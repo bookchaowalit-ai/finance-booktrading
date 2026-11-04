@@ -860,3 +860,80 @@ async def test_unresolved_cancels_survive_a_restart(monkeypatch):
     assert await restarted._load_state("BTCTHB")
 
     assert restarted._unresolved_cancels == {("BTCTHB", "7"): ("SELL", 96.0, 100.0)}
+
+
+class _FakeRedis:
+    def __init__(self, store):
+        self.store = store
+
+    async def set(self, key, value):
+        self.store[key] = value
+
+    async def get(self, key):
+        return self.store.get(key)
+
+
+@pytest.mark.asyncio
+async def test_sync_retry_drops_the_active_sell_and_survives_a_restart(monkeypatch):
+    """The snapshot still lists the SELL while order-status says CANCELED:
+    the retry books 0.3 once, drops the active reference, and a restart
+    cannot book it again."""
+    state = _lots(p100=1.0)
+    state.active_sells = {110.0: "9"}
+    snapshot = [{"orderId": 9, "status": "NEW", "side": "SELL", "price": "110"}]
+    bot, cfg, _ = _bot(monkeypatch, state, open_orders=snapshot, final_executed={9: 0.3})
+    bot._unresolved_cancels[("BTCTHB", "9")] = ("SELL", 110.0, None)
+    store = {}
+    bot._redis = _FakeRedis(store)
+    bot._save_state = RealGridBot._save_state.__get__(bot)
+
+    await bot._sync_open_orders(cfg, state)
+    assert 110.0 not in state.active_sells
+    assert state.lot_qty[100.0] == pytest.approx(0.7)
+    await bot._save_state("BTCTHB")
+
+    restarted, cfg2, _ = _bot(monkeypatch, RealGridState(symbol="BTCTHB", current_order_size=1.0), open_orders=snapshot, final_executed={9: 0.3})
+    restarted._redis = _FakeRedis(store)
+    assert await restarted._load_state("BTCTHB")
+    state2 = restarted.states["BTCTHB"]
+    restarted._verify_fill = AsyncMock(return_value="cancelled")
+    await restarted._sync_open_orders(cfg2, state2)
+
+    assert state2.lot_qty[100.0] == pytest.approx(0.7)
+    assert state2.booked_sells["9"][0] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_live_status_after_a_cancel_is_not_a_final_quantity(monkeypatch):
+    """A stale NEW/PARTIALLY_FILLED read after a confirmed cancel is
+    unknown: the lot is not shrunk and the order is kept for retry."""
+    state = _lots(p100=1.0)
+    state.stop_loss_triggered = {100.0: True}
+    state.stop_loss_orders = {100.0: 96.0}
+    bot, _, _ = _bot(monkeypatch, state, final_executed={7: 0.1}, order_info={7: {"status": "PARTIALLY_FILLED"}})
+
+    await bot._after_confirmed_sell_cancel("BTCTHB", state, 96.0, "7")
+
+    assert state.lot_qty.get(100.0, 1.0) == pytest.approx(1.0)
+    assert state.stop_loss_triggered[100.0] is True
+    assert ("BTCTHB", "7") in bot._unresolved_cancels
+
+
+@pytest.mark.asyncio
+async def test_go_run_started_and_stopped_during_the_drain_is_not_contained(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    bot, _, _ = _bot(monkeypatch, state)
+    get = bot._http.get.side_effect
+    reads = {"n": 0}
+
+    async def run_seq_moves(url, params=None):
+        if url.endswith("/api/bot/status"):
+            reads["n"] += 1
+            return _response(200, {"is_active": False, "run_seq": 4 if reads["n"] == 1 else 5})
+        return await get(url, params=params)
+
+    bot._http.get.side_effect = run_seq_moves
+    result = await bot.kill()
+
+    assert result["contained"] is False
+    assert any(f.get("reason") == "go_running" for f in result["failed"])
