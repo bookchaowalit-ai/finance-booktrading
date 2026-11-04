@@ -291,3 +291,80 @@ async def test_halted_reconcile_survives_a_stop_removed_mid_iteration(monkeypatc
 
     assert state.active_sells == {}
     bot._save_state.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_kill_books_partial_fill_of_an_untracked_buy(monkeypatch):
+    """An order the bot never tracked (its POST timed out) shows up in the
+    drain partly filled: its fill becomes a protected lot."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 99, "side": "BUY", "price": "100"}], final_executed={99: 0.3})
+
+    result = await bot.kill()
+
+    assert result["contained"] is True
+    assert state.lot_qty[100.0] == pytest.approx(0.3)
+    assert 100.0 in state.filled_buy_prices
+    assert _journal_exits(bot, "99") == [("99", 100.0, "FILLED_BUY", 0.0)]
+
+
+@pytest.mark.asyncio
+async def test_kill_books_pnl_of_an_untracked_partial_sell(monkeypatch):
+    state = _lots(p100=1.0)
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 98, "side": "SELL", "price": "110"}], final_executed={98: 0.2})
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(0.8)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
+
+
+@pytest.mark.asyncio
+async def test_untracked_partial_fill_without_side_or_price_is_not_contained(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0)
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 97}], final_executed={97: 0.1})
+
+    result = await bot.kill()
+
+    assert result["contained"] is False
+    assert any(u["orderId"] == 97 for u in result["unreconciled"])
+
+
+@pytest.mark.asyncio
+async def test_kill_closes_journal_of_a_partly_filled_tracked_buy(monkeypatch):
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"})
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 11, "side": "BUY", "price": "100"}], final_executed={11: 0.4})
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(0.4)
+    assert _journal_exits(bot, "11") == [("11", 100.0, "FILLED_BUY", 0.0)]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_sync_does_not_erase_cancellation_tracking(monkeypatch):
+    """A restart-triggered sync running while another sync awaits a cancelled
+    stop's execution must not make the first one re-import that stop."""
+    import asyncio
+
+    state = _lot_with_live_stop()
+    snapshot = [{"orderId": 7, "status": "NEW", "side": "SELL", "price": "96"}]
+    bot, cfg, _ = _bot(monkeypatch, state, open_orders=snapshot)
+    bot._verify_fill = AsyncMock(side_effect=lambda symbol, oid: "filled" if oid == "5" else "open")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def final_executed(client, symbol, oid):
+        if oid == "7":
+            entered.set()
+            await release.wait()
+            return 0.0
+        return 0.4
+
+    bot._final_executed_qty = final_executed
+    first = asyncio.create_task(bot._sync_open_orders(cfg, state))
+    await entered.wait()
+    await bot._sync_open_orders(cfg, RealGridState(symbol="BTCTHB"))  # the overlapping sync
+    release.set()
+    await first
+
+    assert 96.0 not in state.active_sells

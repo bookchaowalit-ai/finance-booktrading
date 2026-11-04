@@ -334,13 +334,14 @@ class RealGridBot:
         self._tick_lock = asyncio.Lock()
         # (symbol, orderId) cancelled by a kill whose final execution is not
         # known yet; every containment re-checks them.
-        self._unresolved_cancels: Dict[tuple, str] = {}  # -> order side
+        self._unresolved_cancels: Dict[tuple, tuple] = {}  # (symbol, id) -> (side, price)
         # Order POSTs whose outcome is unknown (timeout, 5xx): the order may
         # still go live, so containment waits them out (UNCERTAIN_GRACE_SEC).
         self._uncertain_submissions: List[Dict] = []
-        # Orders cancelled while _sync_open_orders runs (superseded stops,
-        # possibly several calls deep); its snapshot still lists them.
-        self._sync_cancelled: Set[str] = set()
+        # One set per running _sync_open_orders (syncs can overlap, e.g. a
+        # restart during a tick): orders cancelled meanwhile, which that
+        # sync's snapshot still lists.
+        self._sync_cancel_sets: List[Set[str]] = []
         # Notification queue for fill events (max 50)
         self._notifications: deque = deque(maxlen=50)
         # Redis client for state persistence (injected via set_redis)
@@ -790,7 +791,8 @@ class RealGridBot:
             state.order_times.pop(oid, None)
             cancelled.add(oid)
             # A sync in progress must not re-import it from its snapshot.
-            self._sync_cancelled.add(oid)
+            for pending in self._sync_cancel_sets:
+                pending.add(oid)
             await self._after_confirmed_sell_cancel(symbol, state, price, oid)
         return cancelled
 
@@ -860,7 +862,9 @@ class RealGridBot:
             logger.warning("Kill: order-status for %s %s failed: %s", symbol, order_id, e)
         return None
 
-    async def _kill_cancel_execution(self, client, result: Dict, symbol: str, order_id: str, side: str) -> Optional[float]:
+    async def _kill_cancel_execution(
+        self, client, result: Dict, symbol: str, order_id: str, side: str, price: float = 0.0
+    ) -> Optional[float]:
         """Final executed quantity of an order containment cancelled, or None.
 
         Unknown execution keeps the order in local state and in
@@ -871,26 +875,50 @@ class RealGridBot:
         executed = await self._final_executed_qty(client, symbol, order_id)
         if executed is None:
             result["unreconciled"].append({"symbol": symbol, "orderId": int(order_id) if order_id.isdigit() else order_id})
-            self._unresolved_cancels[(symbol, order_id)] = side
+            self._unresolved_cancels[(symbol, order_id)] = (side, price)
         return executed
 
-    async def _book_kill_cancel(self, result: Dict, symbol: str, order_id: str, side: str, executed: float):
-        """Book one order containment cancelled, from its final executed quantity."""
+    async def _book_kill_cancel(
+        self, result: Dict, symbol: str, order_id: str, side: str, executed: float, price: float = 0.0
+    ):
+        """Book one order containment cancelled, from its final executed quantity.
+
+        An order the bot never tracked (its POST outcome was unknown) is booked
+        from the snapshot's side and price; without them its fill cannot be
+        booked, so it is reported unreconciled.
+        """
+        oid_out = int(order_id) if order_id.isdigit() else order_id
         if executed > 0:
-            result["partial_fills"].append({
-                "symbol": symbol,
-                "orderId": int(order_id) if order_id.isdigit() else order_id,
-                "side": side,
-                "executedQty": executed,
-            })
+            result["partial_fills"].append({"symbol": symbol, "orderId": oid_out, "side": side, "executedQty": executed})
         state = self.states.get(symbol)
+        buy_price = next((p for p, oid in state.active_buys.items() if oid == order_id), None) if state else None
         tracked_sell = bool(state and order_id in state.active_sells.values())
-        if executed <= 0 and not tracked_sell:
-            # A tracked SELL's entry is closed by _book_cancelled_sell.
+
+        async def journal(exit_price, reason):
             try:
-                await self._journal.record_exit(order_id, 0.0, "CANCELLED", 0.0)
+                await self._journal.record_exit(order_id, exit_price, reason, 0.0)
             except Exception as e:
                 logger.warning("Journal exit (kill cancel) failed: %s", e)
+
+        if state and executed > 0 and buy_price is None and not tracked_sell:
+            if side == "BUY" and price > 0:
+                # The fill opened a position: keep it as a protected lot.
+                state.filled_buy_prices[price] = 0
+                state.buy_fill_prices.setdefault(price, time.time())
+                state.lot_qty[price] = state.lot_qty.get(price, 0.0) + executed
+                await journal(price, "FILLED_BUY")
+            elif side == "SELL" and price > 0:
+                await self._realize_sell(state, price, executed, order_id, "PARTIAL_SELL_CANCELLED")
+            else:
+                logger.error("Kill: untracked order %s %s filled %s but side/price unknown", symbol, order_id, executed)
+                result["unreconciled"].append({"symbol": symbol, "orderId": oid_out})
+            return
+        if executed <= 0 and not tracked_sell:
+            # A tracked SELL's entry is closed by _book_cancelled_sell.
+            await journal(0.0, "CANCELLED")
+        elif executed > 0 and buy_price is not None:
+            # The cancelled BUY's lifecycle ends; its fill stays as a lot.
+            await journal(buy_price, "FILLED_BUY")
         if state:
             await self._forget_cancelled_order(state, order_id, executed)
 
@@ -976,11 +1004,11 @@ class RealGridBot:
                 executions = []
                 # Cancels from an earlier kill whose execution was unknown:
                 # they are off the book now, so only this re-check finds them.
-                for (symbol, order_id), side in list(self._unresolved_cancels.items()):
+                for (symbol, order_id), (side, price) in list(self._unresolved_cancels.items()):
                     del self._unresolved_cancels[(symbol, order_id)]
-                    executed = await self._kill_cancel_execution(client, result, symbol, order_id, side)
+                    executed = await self._kill_cancel_execution(client, result, symbol, order_id, side, price)
                     if executed is not None:
-                        executions.append((symbol, order_id, side, executed))
+                        executions.append((symbol, order_id, side, executed, price))
 
                 symbols = [cfg.symbol for cfg in self.configs]
                 symbols += sorted(sym for sym in go_symbols if sym not in symbols)
@@ -1010,12 +1038,16 @@ class RealGridBot:
                             continue
                         result["cancelled"] += 1
                         side = order.get("side", "")
-                        executed = await self._kill_cancel_execution(client, result, symbol, str(order_id), side)
+                        try:
+                            price = float(order.get("price") or 0)
+                        except (TypeError, ValueError):
+                            price = 0.0
+                        executed = await self._kill_cancel_execution(client, result, symbol, str(order_id), side, price)
                         if executed is not None:
-                            executions.append((symbol, str(order_id), side, executed))
+                            executions.append((symbol, str(order_id), side, executed, price))
 
                 def is_buy(item):
-                    symbol, order_id, side, _ = item
+                    symbol, order_id, side = item[:3]
                     state = self.states.get(symbol)
                     return side == "BUY" or bool(state and order_id in state.active_buys.values())
 
@@ -1322,7 +1354,14 @@ class RealGridBot:
         Only removes orders that no longer exist on exchange (filled/cancelled).
         Does NOT clear state first to prevent duplicate orders.
         """
-        self._sync_cancelled = set()
+        cancelled: Set[str] = set()
+        self._sync_cancel_sets.append(cancelled)
+        try:
+            await self._sync_open_orders_pass(cfg, state, cancelled)
+        finally:
+            self._sync_cancel_sets.remove(cancelled)
+
+    async def _sync_open_orders_pass(self, cfg: RealGridConfig, state: RealGridState, cancelled: Set[str]):
         try:
             resp = await self._http.get(
                 f"{BACKEND_API_BASE}/api/trade/open-orders",
@@ -1503,7 +1542,7 @@ class RealGridBot:
 
                 if status not in ("NEW", "PARTIALLY_FILLED"):
                     continue
-                if price <= 0 or order_id in self._sync_cancelled:
+                if price <= 0 or order_id in cancelled:
                     continue
 
                 if side == "BUY" and price not in state.active_buys:
