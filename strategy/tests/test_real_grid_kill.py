@@ -265,9 +265,10 @@ async def test_partially_filled_buy_becomes_a_protected_lot(monkeypatch):
     assert result["partial_fills"] == [
         {"symbol": "BTCTHB", "orderId": 11, "side": "BUY", "executedQty": 0.00002}
     ]
-    # Journal entry stays open: the trade happened, it was not a plain cancel.
-    closed = [c.args[0] for c in bot._journal.record_exit.await_args_list]
-    assert "11" not in closed
+    # The order's lifecycle ends as a (partial) fill, not a plain cancel; the
+    # backend journal would otherwise keep it OPEN for good.
+    exits = [c.args for c in bot._journal.record_exit.await_args_list if c.args[0] == "11"]
+    assert exits == [("11", 2_000_000.0, "FILLED_BUY", 0.0)]
 
 
 @pytest.mark.asyncio
