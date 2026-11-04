@@ -12,3 +12,11 @@ id = "GHSA-rj75-hqrm-r3gf"
 ignoreUntil = 2027-01-17T00:00:00Z
 reason = """postcss-selector-parser <7.1.6 quadratic parsing. Dev-only: tailwindcss 3 requires ^6 and parses \
 this repository's own CSS at build time, never request input. Fixed by moving to Tailwind 4 (separate change)."""
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2027-01-17T00:00:00Z
+reason = """minimatch 3.1.5, no fixed 3.x release (fix only in 11.0.1). Dev-only: ESLint 8, @eslint/eslintrc, \
+@humanwhocodes/config-array and eslint-plugin-import/jsx-a11y/react require ^3 and call the default export, which \
+11.x removed, so a global override breaks linting. They match this repository's own lint patterns at build time, \
+never request input. Runtime and typescript-estree use minimatch 11.0.4. Re-check when moving to ESLint 9."""
