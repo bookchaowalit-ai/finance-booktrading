@@ -85,6 +85,7 @@ func (s *BotServiceImpl) signalTradeStep(ctx context.Context, book *signalOrderB
 		quantity:      quantity,
 		price:         currentPrice,
 		submittedAt:   book.now(),
+		provider:      ex.currentProvider(),
 	}
 	if err := s.noteSubmission(ctx, symbol, order); err != nil {
 		logger.Warn("Signal trade order not placed", "symbol", symbol, "side", side, "error", err)
@@ -97,7 +98,7 @@ func (s *BotServiceImpl) signalTradeStep(ctx context.Context, book *signalOrderB
 		})
 		return false
 	}
-	report, orderErr := ex.place(ctx, order.clientOrderID, side, quantity, currentPrice)
+	report, orderErr := ex.place(ctx, order.provider, order.clientOrderID, side, quantity, currentPrice)
 	order.provider = report.provider
 	s.settleSubmission(symbol, order, orderErr != nil && exchange.IsOrderStateUnknown(orderErr))
 	if orderErr != nil {

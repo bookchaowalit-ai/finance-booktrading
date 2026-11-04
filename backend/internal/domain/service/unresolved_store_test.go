@@ -17,6 +17,7 @@ type unresolvedStoreRepo struct {
 	orders  map[string]model.UnresolvedOrder
 	saveErr error
 	listErr error
+	saved   []model.UnresolvedOrder // every save, in order
 }
 
 func (r *unresolvedStoreRepo) SaveUnresolvedOrder(ctx context.Context, o model.UnresolvedOrder) error {
@@ -29,6 +30,7 @@ func (r *unresolvedStoreRepo) SaveUnresolvedOrder(ctx context.Context, o model.U
 		r.orders = map[string]model.UnresolvedOrder{}
 	}
 	r.orders[o.ClientOrderID] = o
+	r.saved = append(r.saved, o)
 	return nil
 }
 
@@ -65,6 +67,11 @@ func TestUnknownSubmissionSurvivesBackendRestart(t *testing.T) {
 	first.gridStep(context.Background(), testGrid, book, 110, ex)
 	if len(ex.placed) != 1 {
 		t.Fatalf("placed %v", ex.placed)
+	}
+	// The record written before sending already names the exchange: a crash
+	// mid-placement must not leave a record that means "current provider".
+	if len(repo.saved) == 0 || repo.saved[0].Exchange != "binance" {
+		t.Fatalf("first record %+v", repo.saved)
 	}
 
 	restarted := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})

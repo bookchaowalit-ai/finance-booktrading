@@ -37,7 +37,7 @@ func TestOrderGoesToTheRecordedProvider(t *testing.T) {
 		p.provider = config.ExchangeBinanceTH // a switch right after the read
 		return nil
 	}
-	if _, err := placeOnPinnedProvider(context.Background(), p, record, "BTCUSDT", "grid-x-1", "BUY", 1, 100); err != nil {
+	if _, err := placeOnPinnedProvider(context.Background(), p, record, "", "BTCUSDT", "grid-x-1", "BUY", 1, 100); err != nil {
 		t.Fatal(err)
 	}
 	if len(recorded) != 1 || recorded[0] != "binance" {
@@ -52,7 +52,7 @@ func TestOrderGoesToTheRecordedProvider(t *testing.T) {
 func TestOrderRefusedWhenExchangeNotRecorded(t *testing.T) {
 	p := &switchingPlacer{provider: config.ExchangeBinanceTH}
 	record := func(string) error { return errors.New("db down") }
-	if _, err := placeOnPinnedProvider(context.Background(), p, record, "BTCTHB", "grid-x-2", "BUY", 1, 100); err == nil {
+	if _, err := placeOnPinnedProvider(context.Background(), p, record, "", "BTCTHB", "grid-x-2", "BUY", 1, 100); err == nil {
 		t.Fatal("want an error")
 	} else if exchange.IsOrderStateUnknown(err) {
 		t.Fatal("a refused submission is not an unknown outcome")
@@ -67,7 +67,7 @@ func TestOrderRefusedWhenExchangeNotRecorded(t *testing.T) {
 func TestRecordTimeoutIsNotAnUnknownOutcome(t *testing.T) {
 	p := &switchingPlacer{provider: config.ExchangeBinanceTH}
 	record := func(string) error { return context.DeadlineExceeded }
-	_, err := placeOnPinnedProvider(context.Background(), p, record, "BTCTHB", "grid-x-3", "BUY", 1, 100)
+	_, err := placeOnPinnedProvider(context.Background(), p, record, "", "BTCTHB", "grid-x-3", "BUY", 1, 100)
 	if err == nil || exchange.IsOrderStateUnknown(err) {
 		t.Fatalf("got %v, want a definite not-submitted error", err)
 	}
@@ -77,12 +77,12 @@ func TestRecordTimeoutIsNotAnUnknownOutcome(t *testing.T) {
 // the order can be followed up where it went.
 func TestPlacementReportNamesTheProvider(t *testing.T) {
 	p := &switchingPlacer{provider: config.ExchangeBinance}
-	report, err := placeOnPinnedProvider(context.Background(), p, nil, "BTCUSDT", "grid-x-4", "BUY", 1, 100)
+	report, err := placeOnPinnedProvider(context.Background(), p, nil, "", "BTCUSDT", "grid-x-4", "BUY", 1, 100)
 	if err != nil || report.provider != "binance" {
 		t.Fatalf("got %+v, %v", report, err)
 	}
 	u := &unknownPlacer{switchingPlacer{provider: config.ExchangeBinanceTH}}
-	report, err = placeOnPinnedProvider(context.Background(), u, nil, "BTCTHB", "grid-x-5", "BUY", 1, 100)
+	report, err = placeOnPinnedProvider(context.Background(), u, nil, "", "BTCTHB", "grid-x-5", "BUY", 1, 100)
 	if !exchange.IsOrderStateUnknown(err) || report.provider != "binance_th" {
 		t.Fatalf("got %+v, %v", report, err)
 	}
@@ -162,5 +162,18 @@ func TestParkedOrderIsReconciledOnItsProvider(t *testing.T) {
 	s.reconcileUnresolved()
 	if len(stub.on) != 1 || stub.on[0] != "binance" {
 		t.Fatalf("looked up on %v", stub.on)
+	}
+}
+
+// A pinned provider is used as given, never re-read.
+func TestPlacementUsesThePinnedProvider(t *testing.T) {
+	p := &switchingPlacer{provider: config.ExchangeBinanceTH}
+	var recorded []string
+	record := func(ex string) error { recorded = append(recorded, ex); return nil }
+	if _, err := placeOnPinnedProvider(context.Background(), p, record, "binance", "BTCUSDT", "grid-x-9", "BUY", 1, 100); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorded) != 1 || recorded[0] != "binance" || len(p.placedOn) != 1 || p.placedOn[0] != config.ExchangeBinance {
+		t.Fatalf("recorded %v, placed on %v", recorded, p.placedOn)
 	}
 }

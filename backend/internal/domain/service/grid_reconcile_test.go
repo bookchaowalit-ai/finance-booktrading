@@ -36,7 +36,10 @@ func newScriptedExchange() *scriptedExchange {
 	}
 }
 
-func (e *scriptedExchange) place(ctx context.Context, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
+// currentProvider is placeResp's provider: the one place reports.
+func (e *scriptedExchange) currentProvider() string { return e.placeResp.provider }
+
+func (e *scriptedExchange) place(ctx context.Context, provider, clientOrderID, side string, quantity, price float64) (gridOrderReport, error) {
 	e.placed = append(e.placed, clientOrderID)
 	e.sides = append(e.sides, side)
 	if err := e.placeErr; err != nil {
