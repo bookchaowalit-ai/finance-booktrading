@@ -368,3 +368,25 @@ async def test_overlapping_sync_does_not_erase_cancellation_tracking(monkeypatch
     await first
 
     assert 96.0 not in state.active_sells
+
+
+@pytest.mark.asyncio
+async def test_untracked_buy_adds_to_an_existing_implicit_size_lot(monkeypatch):
+    """A lot without a recorded size holds the order size (1.0); an untracked
+    0.3 fill at the same price makes it 1.3, not 0.3."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, filled_buy_prices={100.0: 0}, buy_fill_prices={100.0: time.time()})
+    bot, _, _ = _bot(monkeypatch, state, open_orders=[{"orderId": 99, "side": "BUY", "price": "100"}], final_executed={99: 0.3})
+
+    await bot.kill()
+
+    assert state.lot_qty[100.0] == pytest.approx(1.3)
+
+
+def test_finished_sync_removes_its_own_cancel_set():
+    """Two syncs' sets compare equal while empty; removal must be by identity."""
+    bot = RealGridBot(configs=[RealGridConfig(symbol="BTCTHB")])
+    first, second = set(), set()
+    bot._sync_cancel_sets = [first, second]
+    bot._end_sync_tracking(second)
+    second.add("x")
+    assert bot._sync_cancel_sets == [first] and bot._sync_cancel_sets[0] is first

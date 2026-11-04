@@ -903,9 +903,12 @@ class RealGridBot:
         if state and executed > 0 and buy_price is None and not tracked_sell:
             if side == "BUY" and price > 0:
                 # The fill opened a position: keep it as a protected lot.
+                # An open lot at that price keeps its size (recorded, or the
+                # order size when unrecorded) and grows by the fill.
+                held = self._lot_quantity(state, price) if price in state.buy_fill_prices else 0.0
                 state.filled_buy_prices[price] = 0
                 state.buy_fill_prices.setdefault(price, time.time())
-                state.lot_qty[price] = state.lot_qty.get(price, 0.0) + executed
+                state.lot_qty[price] = held + executed
                 await journal(price, "FILLED_BUY")
             elif side == "SELL" and price > 0:
                 await self._realize_sell(state, price, executed, order_id, "PARTIAL_SELL_CANCELLED")
@@ -1359,7 +1362,11 @@ class RealGridBot:
         try:
             await self._sync_open_orders_pass(cfg, state, cancelled)
         finally:
-            self._sync_cancel_sets.remove(cancelled)
+            self._end_sync_tracking(cancelled)
+
+    def _end_sync_tracking(self, cancelled: Set[str]):
+        # By identity: another sync's set can compare equal (both empty).
+        self._sync_cancel_sets = [s for s in self._sync_cancel_sets if s is not cancelled]
 
     async def _sync_open_orders_pass(self, cfg: RealGridConfig, state: RealGridState, cancelled: Set[str]):
         try:
