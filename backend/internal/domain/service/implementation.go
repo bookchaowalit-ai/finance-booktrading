@@ -957,7 +957,9 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	status.UnresolvedOrders = s.unresolvedOrderList()
 
 	s.runningMu.RLock()
-	status.IsActive = s.isRunning || busyBefore
+	// A run that started during the read may have placed orders after a
+	// drain: report it active, keeping the pre-read counter for the list.
+	status.IsActive = s.isRunning || busyBefore || s.runSeq != seqBefore
 	status.RunSeq = seqBefore
 	// Include trading stats if available
 	status.TotalTrades = s.botStatus.TotalTrades

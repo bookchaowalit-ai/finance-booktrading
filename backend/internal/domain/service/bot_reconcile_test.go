@@ -415,6 +415,10 @@ func TestStatusRunSeqPrecedesTheSymbolRead(t *testing.T) {
 	if st.RunSeq != 0 {
 		t.Fatalf("reported run_seq %d, want the pre-read 0", st.RunSeq)
 	}
+	// It may have traded after a drain that this read is verifying.
+	if !st.IsActive {
+		t.Fatal("a run that started during the read must be reported active")
+	}
 }
 
 // A run active (or still stopping) when the read began is reported active,

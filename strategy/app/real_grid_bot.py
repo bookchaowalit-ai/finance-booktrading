@@ -1232,13 +1232,17 @@ class RealGridBot:
                 # unresolved: booked now it would estimate a profit that the
                 # BUY, booked later, could not correct. It stays a recorded
                 # cancel; the next containment or sync books it.
-                blocked = {
-                    sym for (sym, oid), (side, _, _) in self._unresolved_cancels.items()
-                    if side != "SELL"
-                }
+                # Checked per SELL, after the BUYs before it were booked
+                # (booking a BUY retires its record).
+                def blocked(symbol):
+                    return any(
+                        sym == symbol and side != "SELL"
+                        for (sym, _), (side, _, _) in self._unresolved_cancels.items()
+                    )
+
                 for item in sorted(executions, key=lambda item: not is_buy(item)):
                     symbol, order_id, side, executed, price, stop_lot = item
-                    if side == "SELL" and not is_buy(item) and symbol in blocked:
+                    if side == "SELL" and not is_buy(item) and blocked(symbol):
                         state = self.states.get(symbol)
                         if stop_lot is None and state and price > 0:
                             stop_lot = self._stop_lot_for(state, price)

@@ -1011,3 +1011,48 @@ async def test_kill_drain_is_pinned_to_the_exchange_read_at_its_start(monkeypatc
     cancels = [b for u, b in posted if u.endswith("/api/trade/cancel-order")]
     assert cancels and all(b.get("exchange") == "binance_th" for b in cancels)
     assert bot._drain_exchange is None  # outside a drain, requests are unpinned
+
+
+@pytest.mark.asyncio
+async def test_sell_books_once_its_blocking_buy_is_booked_in_the_same_kill(monkeypatch):
+    """Kill 1: the BUY's cancel fails (live), so the SELL waits. Kill 2: the
+    BUY is still live at the re-check but cancelled by the drain with a
+    known fill; once it is booked, the SELL is no longer blocked."""
+    state = RealGridState(symbol="BTCTHB", current_order_size=1.0, active_buys={100.0: "11"}, active_sells={110.0: "12"})
+    bot, _, _ = _bot(monkeypatch, state)
+    cancelled, attempt = set(), {"n": 0}
+
+    async def post(url, json=None):
+        if url.endswith("/api/trade/cancel-order"):
+            oid = json["orderId"]
+            if oid == 11 and attempt["n"] == 1:
+                return _response(502)
+            cancelled.add(oid)
+        return _response(200)
+
+    async def get(url, params=None):
+        if url.endswith("/api/bot/status"):
+            return _response(200, {"is_active": False})
+        if url.endswith("/api/trade/order-status"):
+            oid = int(params["orderId"])
+            if oid not in cancelled:
+                return _response(200, {"status": "NEW", "executedQty": "0"})
+            return _response(200, {"status": "CANCELED", "executedQty": {11: "0.5", 12: "0.2"}[oid]})
+        orders = [{"orderId": 11, "side": "BUY", "price": "100"}] if 11 not in cancelled else []
+        if 12 not in cancelled:
+            orders.insert(0, {"orderId": 12, "side": "SELL", "price": "110"})
+        return _response(200, {"orders": orders})
+
+    bot._http.post.side_effect = post
+    bot._http.get.side_effect = get
+
+    attempt["n"] = 1
+    first = await bot.kill()
+    assert first["contained"] is False and state.cumulative_pnl == 0
+
+    attempt["n"] = 2
+    second = await bot.kill()
+
+    assert second["contained"] is True, second
+    assert state.lot_qty[100.0] == pytest.approx(0.3)
+    assert state.cumulative_pnl == pytest.approx(_net(110.0, [(100.0, 0.2)]))
