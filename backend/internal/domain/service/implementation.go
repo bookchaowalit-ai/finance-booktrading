@@ -347,9 +347,14 @@ type BotServiceImpl struct {
 	exchangeName func() string
 	// marketListed checks the exchange lists a Start symbol before it is
 	// recorded (a test seam; nil = the exchange manager's check, or none).
-	marketListed   func(ctx context.Context, exchange, symbol string) error
-	runJoined      chan struct{}
-	runSeq         uint64 // runs started; guarded by runningMu
+	marketListed func(ctx context.Context, exchange, symbol string) error
+	runJoined    chan struct{}
+	runSeq       uint64 // runs started; guarded by runningMu
+	// startsPending counts Starts in their market lookup and stopSeq counts
+	// Stop calls (both guarded by runningMu): a Stop during the lookup
+	// cancels that Start, and status reports a pending Start as active.
+	startsPending  int
+	stopSeq        uint64
 	stopPending    bool
 	stopFinalizing bool
 	startedAt      time.Time
@@ -486,13 +491,25 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	// A recorded symbol stays in every kill switch drain, so only a market
 	// the exchange lists is recorded. The lookup runs before runningMu so
 	// status reads are not held behind it.
-	checkedExchange := s.currentExchange()
+	s.runningMu.Lock()
+	s.startsPending++
+	stopSeqBefore := s.stopSeq
+	checkedExchange := s.exchangeLocked()
+	s.runningMu.Unlock()
+	defer func() {
+		s.runningMu.Lock()
+		s.startsPending--
+		s.runningMu.Unlock()
+	}()
 	if err := s.checkStartMarket(ctx, params, checkedExchange); err != nil {
 		return err
 	}
 
 	s.runningMu.Lock()
 	defer s.runningMu.Unlock()
+	if s.stopSeq != stopSeqBefore {
+		return fmt.Errorf("bot was stopped during start")
+	}
 	if s.exchangeLocked() != checkedExchange {
 		return fmt.Errorf("exchange changed during start, retry")
 	}
@@ -975,6 +992,7 @@ func (s *BotServiceImpl) goLoop(fn func()) {
 // runningMu, so the wait happens after the lock is released.
 func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.runningMu.Lock()
+	s.stopSeq++
 	switch {
 	case s.isRunning:
 		s.cancel()
@@ -1060,7 +1078,7 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	// one active or still stopping now is reported active, so a kill switch
 	// comparing counters never takes an older symbol list as complete.
 	s.runningMu.RLock()
-	seqBefore, busyBefore := s.runSeq, s.isRunning || s.stopPending
+	seqBefore, busyBefore := s.runSeq, s.isRunning || s.stopPending || s.startsPending > 0
 	s.runningMu.RUnlock()
 	// Fewer symbols than were traded would let the kill switch skip live
 	// orders, so an unreadable list fails the status read.

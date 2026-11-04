@@ -470,3 +470,38 @@ func TestStartRefusesUnlistedSymbolBeforeRecording(t *testing.T) {
 		t.Fatalf("unlisted symbol recorded or bot active: %v %v", st.Symbols, st.IsActive)
 	}
 }
+
+// A Stop while Start waits on its market lookup wins: the Start must not
+// begin trading after it, and status reports the pending Start as active
+// so a kill switch never takes it for contained.
+func TestStopDuringStartMarketCheckCancelsTheStart(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.exchangeName = func() string { return "binance_th" }
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.marketListed = func(context.Context, string, string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	started := make(chan error, 1)
+	go func() { started <- s.Start(context.Background(), validGrid()) }()
+	<-entered
+
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.IsActive {
+		t.Fatal("pending Start reported inactive")
+	}
+	_ = s.Stop(context.Background())
+	close(release)
+	if err := <-started; err == nil {
+		s.Stop(context.Background())
+		t.Fatal("Start went ahead after a Stop")
+	}
+	if s.IsRunning(context.Background()) {
+		t.Fatal("bot running after Stop")
+	}
+}
