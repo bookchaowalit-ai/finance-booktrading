@@ -23,10 +23,41 @@ type ScrubbableEvent = {
 const SAFE_CONTEXTS = ["os", "runtime", "browser", "device", "app"];
 
 const stripQuery = (value: string) => value.split(/[?#]/)[0];
-// Drops a ?query or #hash glued to any word inside free text, e.g. an error message: full URLs,
-// absolute paths and bare words such as `api?token=x`. A lone "?" at the end of a word, or a
-// "#5" after a space, is not a query and stays.
-const stripUrlQueries = (text: string) => text.replace(/([^\s?#"'<>()])[?#][^\s"'<>()]+/g, "$1");
+const OPENER_OF = new Map([[")", "("], ["]", "["], ["}", "{"], [">", "<"]]);
+// Drops a ?query or #hash inside free text, e.g. an error message. One glued to a word (full URLs,
+// absolute paths, bare words such as `api?token=x`, quoted or parenthesised queries) is cut up to the
+// next whitespace, so no character of the value survives except closing brackets that close one opened
+// earlier in the text, such as the ")" of "(see /p?x=1)". A `?key=value` or `#key=value` word goes
+// whole. A lone "?" at the end of a word, or a "#5" after a space, is not a query and stays.
+const stripUrlQueries = (text: string) => {
+  const unclosed = new Map<string, number>();
+  const track = (part: string) => {
+    for (const char of part) {
+      const opener = OPENER_OF.get(char);
+      if (opener) unclosed.set(opener, Math.max(0, (unclosed.get(opener) ?? 0) - 1));
+      else if ("([{<".includes(char)) unclosed.set(char, (unclosed.get(char) ?? 0) + 1);
+    }
+  };
+  return text.replace(/\S+/g, (word) => {
+    if (/^[?#][^=]*=/.test(word)) return "";
+    const at = word.slice(1).search(/[?#]/) + 1;
+    if (at === 0 || at === word.length - 1) {
+      track(word);
+      return word;
+    }
+    const head = word.slice(0, at);
+    track(head);
+    let end = word.length;
+    while (end > at + 1) {
+      const opener = OPENER_OF.get(word.charAt(end - 1));
+      const open = opener ? (unclosed.get(opener) ?? 0) : 0;
+      if (!opener || open === 0) break;
+      unclosed.set(opener, open - 1);
+      end -= 1;
+    }
+    return head + word.slice(end);
+  });
+};
 
 export function scrubEvent<T extends ScrubbableEvent>(event: T): T {
   delete event.request;

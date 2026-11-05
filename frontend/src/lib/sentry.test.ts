@@ -100,4 +100,14 @@ describe("scrubEvent: request path and query strings", () => {
     const event = scrubEvent({ message: "call api?token=secret&x=1 failed; are you sure? see item #5" });
     expect(event.message).toBe("call api failed; are you sure? see item #5");
   });
+
+  it("strips quoted, parenthesised, punctuation-only and leading queries up to the next space", () => {
+    const event = scrubEvent({ message: "?key=secret at start; fetch(\"?token=secret\") failed: api?token=(secret) and x?q=a'secret' (see /p?x=secret). Ref #access_token=secret ok" });
+    const glued = scrubEvent({ message: "Failed https://example.com/api?token=(secret)" });
+    const punctuation = scrubEvent({ message: "/search?q=!!! and /api?password=secret!!! and /search#!!! and (/x?y=secret))" });
+    expect(event.message).toBe(" at start; fetch(\") failed: api and x (see /p Ref  ok");
+    expect(glued.message).toBe("Failed https://example.com/api");
+    expect(punctuation.message).toBe("/search and /api and /search and (/x)");
+    expect(JSON.stringify([event, glued, punctuation])).not.toMatch(/secret|!/);
+  });
 });
