@@ -38,10 +38,7 @@ export default async function LocaleLayout({
         <a className="skip-link" href="#main-content">
           {lang === 'th' ? 'ข้ามไปเนื้อหาหลัก' : 'Skip to main content'}
         </a>
-        {/* Skip-link target for every page under [lang]. tabIndex -1 lets the skip link move focus here. */}
-        <div id="main-content" tabIndex={-1} className="outline-none">
-          {children}
-        </div>
+        {children}
       </body>
     </html>
   );

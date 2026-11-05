@@ -9,7 +9,7 @@ export default function NotFound() {
   const router = useRouter();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 flex items-center justify-center px-4">
+    <main id="main-content" tabIndex={-1} className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 flex items-center justify-center px-4 outline-none">
       <div className="max-w-2xl w-full text-center">
         {/* Animated 404 Text */}
         <div className="mb-8">
@@ -76,6 +76,6 @@ export default function NotFound() {
           <p>{t('notfound.helpText')}</p>
         </div>
       </div>
-    </div>
+    </main>
   );
 }

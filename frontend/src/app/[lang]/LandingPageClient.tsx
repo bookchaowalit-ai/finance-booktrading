@@ -308,7 +308,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
         )}
       </header>
 
-      <main>
+      <main id="main-content" tabIndex={-1} className="outline-none">
       {/* ── Hero ───────────────────────────────────────────────────────────── */}
       <section className="relative pt-32 pb-24 px-6 overflow-hidden">
         {/* Glow */}

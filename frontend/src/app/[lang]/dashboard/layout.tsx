@@ -242,8 +242,8 @@ export default function DashboardLayout({
               </div>
             </nav>
 
-            {/* Page Content - Scrollable */}
-            <div className="p-4 pb-20 lg:p-6">
+            {/* Page Content - Scrollable. Skip-link target: lands after the top nav, not on it. */}
+            <div id="main-content" tabIndex={-1} className="p-4 pb-20 lg:p-6 outline-none">
               <ErrorBoundary>
                 {children}
               </ErrorBoundary>
