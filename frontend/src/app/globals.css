@@ -1,6 +1,7 @@
-/* ADR-0007 design floor: vendored tokens go in the base layer, so unlayered utilities (focus:outline-none,
- * tracking, leading) win over the floor's defaults. app-theme.css holds this app's values. */
-@import "./design-floor/tokens.css" layer(base);
+/* ADR-0007 design floor. Tailwind v3 (postcss-import) rewrites `layer(base)` to `@media layer(base)`, which
+ * browsers drop, so these imports stay unlayered and come BEFORE the Tailwind directives: the utilities that
+ * follow win at equal specificity. app-theme.css holds this app's values and comes after tokens.css. */
+@import "./design-floor/tokens.css";
 @import "./app-theme.css";
 
 @tailwind base;

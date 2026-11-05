@@ -59,7 +59,7 @@ export default function LanguageSelector() {
       {/* Dark Mode Toggle */}
       <button
         onClick={toggleDarkMode}
-        className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        className="p-2 rounded-lg hover:bg-slate-800 transition-colors"
         aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
         title={isDark ? 'Light mode' : 'Dark mode'}
       >
@@ -74,7 +74,7 @@ export default function LanguageSelector() {
       <div className="relative">
         <button
           onClick={() => setIsOpen(!isOpen)}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-slate-800 transition-colors"
           aria-label="Select language"
         >
           <Globe className="w-5 h-5 text-gray-600 dark:text-gray-400" />

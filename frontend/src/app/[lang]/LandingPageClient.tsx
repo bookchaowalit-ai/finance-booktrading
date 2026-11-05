@@ -308,7 +308,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
         )}
       </header>
 
-      <main id="main-content">
+      <main>
       {/* ── Hero ───────────────────────────────────────────────────────────── */}
       <section className="relative pt-32 pb-24 px-6 overflow-hidden">
         {/* Glow */}
