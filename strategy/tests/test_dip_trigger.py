@@ -179,7 +179,7 @@ def test_ac11_parse_yahoo_chart_skips_null_bars():
     dates, closes, volumes = parse_yahoo_chart(payload)
 
     assert closes == [100.0, 95.0]
-    assert volumes == [10.0, 30.0]
+    assert volumes == [10.0, None]  # bar after a skipped one carries the gap (round 3)
     assert len(dates) == 2 and dates[0] < dates[1]
 
 
@@ -421,3 +421,63 @@ def test_cli_symbols_are_canonicalised_for_benchmark_and_lookups():
 
 def test_mapping_keys_are_canonicalised():
     assert dip_script.canonical_keys({" nvda ": 5}) == {"NVDA": 5}
+
+
+# --- Codex review round 3 (2026-11-07) ---
+
+
+def test_dropped_null_close_bar_leaves_a_volume_gap():
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [1762300800, 1762387200, 1762473600],
+                    "indicators": {"quote": [{"close": [100.0, None, 95.0], "volume": [10, None, 30]}]},
+                }
+            ]
+        }
+    }
+
+    _, closes, volumes = parse_yahoo_chart(payload)
+
+    assert closes == [100.0, 95.0]
+    assert volumes == [10.0, None]  # the bar after the gap carries it, so the volume signal skips
+
+
+def test_dates_use_the_exchange_timezone():
+    # 2026-11-05 21:00 UTC is 2026-11-06 10:00 in Auckland (NZDT, UTC+13).
+    stamp = int(datetime(2026, 11, 5, 21, 0, tzinfo=UTC).timestamp())
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "meta": {"exchangeTimezoneName": "Pacific/Auckland"},
+                    "timestamp": [stamp],
+                    "indicators": {"quote": [{"close": [10.0], "volume": [1]}]},
+                }
+            ]
+        }
+    }
+
+    dates, _, _ = parse_yahoo_chart(payload)
+
+    assert dates == [date(2026, 11, 6)]
+
+
+def test_unknown_timezone_falls_back_to_utc():
+    stamp = int(datetime(2026, 11, 5, 21, 0, tzinfo=UTC).timestamp())
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "meta": {"exchangeTimezoneName": "Not/AZone"},
+                    "timestamp": [stamp],
+                    "indicators": {"quote": [{"close": [10.0], "volume": [1]}]},
+                }
+            ]
+        }
+    }
+
+    dates, _, _ = parse_yahoo_chart(payload)
+
+    assert dates == [date(2026, 11, 5)]

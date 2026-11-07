@@ -25,6 +25,7 @@ from enum import StrEnum
 from math import isfinite
 from statistics import fmean, pstdev
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DIP_TRIGGER_VERSION = "dip-trigger.v1"
 
@@ -309,7 +310,10 @@ def parse_yahoo_chart(
 ) -> tuple[list[date], list[float], list[float | None]]:
     """Daily bars from a Yahoo v8 chart response.
 
-    Skips bars with no close, keeps a missing volume as ``None``, and drops the last bar while its regular session
+    Dates are calendar days in ``meta.exchangeTimezoneName`` (UTC if unknown).
+    Skips bars with no close, keeps a missing volume as ``None``, marks the bar
+    after a skipped one with volume ``None`` so the gap still blocks the volume
+    signal, and drops the last bar while its regular session
     (``meta.currentTradingPeriod.regular``) is still open: that bar's close is
     only the latest trade and its volume is partial.
     """
@@ -321,7 +325,12 @@ def parse_yahoo_chart(
     quote = ((bar.get("indicators") or {}).get("quote") or [{}])[0]
     raw_closes = quote.get("close") or []
     raw_volumes = quote.get("volume") or []
-    regular = ((bar.get("meta") or {}).get("currentTradingPeriod") or {}).get("regular") or {}
+    meta = bar.get("meta") or {}
+    try:
+        zone = ZoneInfo(str(meta.get("exchangeTimezoneName") or "UTC"))
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = UTC
+    regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
     session_start, session_end = regular.get("start"), regular.get("end")
     now_ts = (now or datetime.now(UTC)).timestamp()
     session_known = session_start is not None and session_end is not None
@@ -331,14 +340,17 @@ def parse_yahoo_chart(
     dates: list[date] = []
     closes: list[float] = []
     volumes: list[float | None] = []
+    gap = False
     for i, stamp in enumerate(stamps):
         close = raw_closes[i] if i < len(raw_closes) else None
         if close is None:
+            gap = True
             continue
         volume = raw_volumes[i] if i < len(raw_volumes) else None
-        dates.append(datetime.fromtimestamp(stamp, tz=UTC).date())
+        dates.append(datetime.fromtimestamp(stamp, tz=zone).date())
         closes.append(float(close))
-        volumes.append(None if volume is None else float(volume))
+        volumes.append(None if volume is None or gap else float(volume))
+        gap = False
     if not closes:
         raise ValueError("chart response has no closes")
     return dates, closes, volumes

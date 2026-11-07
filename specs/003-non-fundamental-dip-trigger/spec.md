@@ -64,7 +64,10 @@ headroom; at or over the cap it says "no room" (`at_cap=True`).
 | AC-17 | The script still evaluates the stock when only the benchmark fetch fails (benchmark signal dropped) | same |
 | AC-18 | CLI symbols and `--weights` / `--margin` keys are canonicalised before benchmark choice and lookups | same |
 
-AC-12 to AC-18 came from two Codex review rounds on 2026-11-07. Red first each round (8, then 6 new tests failed), then passed.
+| AC-19 | A bar skipped for a null close leaves the next bar's volume `None`, so the gap still blocks the volume signal | same |
+| AC-20 | Bar dates are calendar days in `meta.exchangeTimezoneName` (UTC if unknown) | same |
+
+AC-12 to AC-20 came from three Codex review rounds on 2026-11-07. Red first each round (8, 6, then 2 new tests failed), then passed.
 
 ## 4. Out of scope (follow-up)
 
