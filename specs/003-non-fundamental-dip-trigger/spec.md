@@ -55,6 +55,12 @@ headroom; at or over the cap it says "no room" (`at_cap=True`).
 | AC-9 | Event older than the lookback, or for another symbol → ignored | same |
 | AC-10 | Thai alert text has the symbol, status, drop, reasons, headroom and the "not advice, no order placed" line | same |
 | AC-11 | The script parses Yahoo chart JSON into closes and volumes and skips null bars (no network in tests) | same |
+| AC-12 | With dates given, the benchmark return uses the stock's own window dates; no exact match → signal skipped with a reason | same |
+| AC-13 | The parser drops the last bar while its regular session is still open (`meta.currentTradingPeriod`) | same |
+| AC-14 | Symbols are matched case- and space-insensitively (`nvda` == `NVDA`) | same |
+| AC-15 | Exact boundaries count: 100 → 92 is a −8 % drop; margin 1000 → 900 is −10 % (tolerance `EPS`) | same |
+
+AC-12 to AC-15 came from the Codex review on 2026-11-07. Red first: 8 new tests failed, then passed.
 
 ## 4. Out of scope (follow-up)
 

@@ -74,7 +74,7 @@ async def run(args: argparse.Namespace) -> int:
             benchmark = args.benchmark or default_benchmark(symbol)
             try:
                 dates, closes, volumes = await fetch_chart(client, symbol)
-                _, bench_closes, _ = await fetch_chart(client, benchmark)
+                bench_dates, bench_closes, _ = await fetch_chart(client, benchmark)
             except (httpx.HTTPError, ValueError) as exc:
                 print(f"{symbol}: fetch failed ({exc})", file=sys.stderr)
                 continue
@@ -86,6 +86,8 @@ async def run(args: argparse.Namespace) -> int:
                     closes=closes,
                     volumes=volumes,
                     benchmark_closes=bench_closes,
+                    dates=dates,
+                    benchmark_dates=bench_dates,
                     events=events,
                     margin_balance_before=margin.get("before"),
                     margin_balance_now=margin.get("now"),

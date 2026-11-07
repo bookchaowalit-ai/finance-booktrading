@@ -41,6 +41,13 @@ FUNDAMENTAL_EVENT_KINDS = frozenset(
 
 VOLUME_BASELINE_DAYS = 20
 
+# Inclusive thresholds compare with this slack so exact boundaries (100 -> 92 is -8 %) survive float error.
+EPS = 1e-9
+
+
+def canonical_symbol(symbol: str) -> str:
+    return symbol.strip().upper()
+
 
 class DipStatus(StrEnum):
     TRIGGER = "TRIGGER"
@@ -76,11 +83,15 @@ class FundamentalEvent:
     occurred_on: date
     title: str = ""
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
+        object.__setattr__(self, "kind", self.kind.strip().lower())
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> FundamentalEvent:
         return cls(
-            symbol=str(raw["symbol"]).strip(),
-            kind=str(raw["kind"]).strip().lower(),
+            symbol=str(raw["symbol"]),
+            kind=str(raw["kind"]),
             occurred_on=date.fromisoformat(str(raw["occurred_on"])),
             title=str(raw.get("title", "")).strip(),
         )
@@ -88,7 +99,12 @@ class FundamentalEvent:
 
 @dataclass(frozen=True)
 class DipInput:
-    """Closes and volumes run oldest to newest; the last bar is ``as_of``."""
+    """Closes and volumes run oldest to newest; the last bar is ``as_of``.
+
+    When ``dates`` and ``benchmark_dates`` are both given, the benchmark return is
+    taken between the stock's own window dates (exact date match), so a holiday or
+    suspension cannot pair the stock with an unrelated benchmark window.
+    """
 
     symbol: str
     as_of: date
@@ -99,6 +115,8 @@ class DipInput:
     margin_balance_before: float | None = None
     margin_balance_now: float | None = None
     weight_pct: float | None = None
+    dates: Sequence[date] | None = None
+    benchmark_dates: Sequence[date] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +155,21 @@ def _window_return_pct(closes: Sequence[float], window: int) -> float | None:
     return (closes[-1] / closes[-1 - window] - 1) * 100
 
 
+def _benchmark_return_pct(inp: DipInput, window: int) -> float | None:
+    bench = _validate_prices(inp.benchmark_closes or (), "benchmark_closes")
+    if inp.dates is None or inp.benchmark_dates is None:
+        return _window_return_pct(bench, window)
+    if len(inp.dates) != len(inp.closes) or len(inp.benchmark_dates) != len(bench):
+        raise ValueError("dates must line up with their closes")
+    if len(inp.dates) < window + 1:
+        return None
+    by_date = dict(zip(inp.benchmark_dates, bench, strict=True))
+    start, end = by_date.get(inp.dates[-1 - window]), by_date.get(inp.dates[-1])
+    if start is None or end is None:
+        return None
+    return (end / start - 1) * 100
+
+
 def _zscore(value: float, sample: Sequence[float]) -> float:
     mean = fmean(sample)
     spread = pstdev(sample)
@@ -157,7 +190,7 @@ def _fundamental_hits(inp: DipInput, config: DipTriggerConfig) -> list[Fundament
     return [
         event
         for event in inp.events or ()
-        if event.symbol == inp.symbol
+        if event.symbol == canonical_symbol(inp.symbol)
         and event.kind in FUNDAMENTAL_EVENT_KINDS
         and earliest <= event.occurred_on <= inp.as_of
     ]
@@ -169,9 +202,10 @@ def _forced_signals(inp: DipInput, config: DipTriggerConfig) -> tuple[list[str],
     window = config.window_days
 
     if inp.benchmark_closes:
-        bench = _validate_prices(inp.benchmark_closes, "benchmark_closes")
-        bench_pct = _window_return_pct(bench, window)
-        if bench_pct is not None and bench_pct <= -config.min_benchmark_drop_pct:
+        bench_pct = _benchmark_return_pct(inp, window)
+        if bench_pct is None and inp.dates is not None and inp.benchmark_dates is not None:
+            reasons.append("ไม่มีข้อมูลตลาดในวันที่ตรงกันกับช่วงของหุ้น ข้ามสัญญาณนี้")
+        if bench_pct is not None and bench_pct <= -config.min_benchmark_drop_pct + EPS:
             signals.append("benchmark_down")
             reasons.append(f"ตลาด/กลุ่มลง {bench_pct:.1f}% ในช่วงเดียวกัน")
 
@@ -179,14 +213,14 @@ def _forced_signals(inp: DipInput, config: DipTriggerConfig) -> tuple[list[str],
     if len(volumes) >= window + VOLUME_BASELINE_DAYS:
         baseline = fmean(volumes[-window - VOLUME_BASELINE_DAYS : -window])
         peak = max(volumes[-window:])
-        if baseline > 0 and peak / baseline >= config.min_volume_ratio:
+        if baseline > 0 and peak / baseline >= config.min_volume_ratio - EPS:
             signals.append("volume_spike")
             reasons.append(f"วอลุ่มสูงสุด {peak / baseline:.1f}x ของค่าเฉลี่ย 20 วัน")
 
     before, now = inp.margin_balance_before, inp.margin_balance_now
     if before is not None and now is not None and before > 0:
         margin_pct = (now / before - 1) * 100
-        if margin_pct <= -config.min_margin_drop_pct:
+        if margin_pct <= -config.min_margin_drop_pct + EPS:
             signals.append("margin_unwind")
             reasons.append(f"ยอด margin ลด {margin_pct:.1f}%")
 
@@ -226,7 +260,7 @@ def evaluate_dip(inp: DipInput, config: DipTriggerConfig | None = None) -> DipTr
     z = _zscore(worst, daily[-window - config.lookback_days : -window])
     reasons = [f"ลง {drop:.1f}% ใน {window} วัน (z-score วันแย่สุด {z:.1f})"]
 
-    if drop > -config.min_drop_pct or z > -config.min_zscore:
+    if drop > -config.min_drop_pct + EPS or z > -config.min_zscore + EPS:
         return result(DipStatus.NO_DIP, drop=drop, z=z, reasons=reasons)
 
     signals, signal_reasons = _forced_signals(inp, config)
@@ -268,8 +302,15 @@ def format_alert_th(result: DipTriggerResult) -> str:
     return "\n".join(lines)
 
 
-def parse_yahoo_chart(payload: Mapping[str, Any]) -> tuple[list[date], list[float], list[float]]:
-    """Daily bars from a Yahoo v8 chart response, skipping bars with no close."""
+def parse_yahoo_chart(
+    payload: Mapping[str, Any], *, now: datetime | None = None
+) -> tuple[list[date], list[float], list[float]]:
+    """Daily bars from a Yahoo v8 chart response.
+
+    Skips bars with no close, and drops the last bar while its regular session
+    (``meta.currentTradingPeriod.regular``) is still open: that bar's close is
+    only the latest trade and its volume is partial.
+    """
     results = (payload.get("chart") or {}).get("result") or []
     if not results:
         raise ValueError("chart response has no result")
@@ -278,6 +319,12 @@ def parse_yahoo_chart(payload: Mapping[str, Any]) -> tuple[list[date], list[floa
     quote = ((bar.get("indicators") or {}).get("quote") or [{}])[0]
     raw_closes = quote.get("close") or []
     raw_volumes = quote.get("volume") or []
+    regular = ((bar.get("meta") or {}).get("currentTradingPeriod") or {}).get("regular") or {}
+    session_start, session_end = regular.get("start"), regular.get("end")
+    now_ts = (now or datetime.now(UTC)).timestamp()
+    session_known = session_start is not None and session_end is not None
+    if stamps and session_known and stamps[-1] >= session_start and now_ts < session_end:
+        stamps = stamps[:-1]
 
     dates: list[date] = []
     closes: list[float] = []
