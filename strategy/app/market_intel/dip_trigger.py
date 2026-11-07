@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from math import isfinite
 from statistics import fmean, pstdev
 from typing import Any
@@ -105,19 +106,26 @@ class DipInput:
     When ``dates`` and ``benchmark_dates`` are both given, the benchmark return is
     taken between the stock's own window dates (exact date match), so a holiday or
     suspension cannot pair the stock with an unrelated benchmark window.
+
+    A ``None`` close marks a session with no price. It keeps its slot so the
+    window still counts real sessions; a gap inside the window fails closed.
+
+    ``news_as_of`` (default ``as_of``) is the last day searched for fundamental
+    events, so news published after the latest completed bar still vetoes.
     """
 
     symbol: str
     as_of: date
-    closes: Sequence[float]
+    closes: Sequence[float | None]
     volumes: Sequence[float | None] | None = None
-    benchmark_closes: Sequence[float] | None = None
+    benchmark_closes: Sequence[float | None] | None = None
     events: Sequence[FundamentalEvent] | None = None
     margin_balance_before: float | None = None
     margin_balance_now: float | None = None
     weight_pct: float | None = None
     dates: Sequence[date] | None = None
     benchmark_dates: Sequence[date] | None = None
+    news_as_of: date | None = None
 
 
 @dataclass(frozen=True)
@@ -136,9 +144,12 @@ class DipTriggerResult:
     version: str = DIP_TRIGGER_VERSION
 
 
-def _validate_prices(values: Sequence[float], name: str) -> list[float]:
-    result = []
+def _validate_prices(values: Sequence[float | None], name: str) -> list[float | None]:
+    result: list[float | None] = []
     for value in values:
+        if value is None:
+            result.append(None)
+            continue
         number = float(value)
         if not isfinite(number) or number <= 0:
             raise ValueError(f"{name} must be finite positive numbers")
@@ -146,14 +157,21 @@ def _validate_prices(values: Sequence[float], name: str) -> list[float]:
     return result
 
 
-def _returns(closes: Sequence[float]) -> list[float]:
-    return [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+def _returns(closes: Sequence[float | None]) -> list[float | None]:
+    """Daily returns; ``None`` where either side of the pair is missing."""
+    out: list[float | None] = []
+    for prev, cur in pairwise(closes):
+        out.append(None if prev is None or cur is None else cur / prev - 1)
+    return out
 
 
-def _window_return_pct(closes: Sequence[float], window: int) -> float | None:
+def _window_return_pct(closes: Sequence[float | None], window: int) -> float | None:
     if len(closes) < window + 1:
         return None
-    return (closes[-1] / closes[-1 - window] - 1) * 100
+    start, end = closes[-1 - window], closes[-1]
+    if start is None or end is None:
+        return None
+    return (end / start - 1) * 100
 
 
 def _benchmark_return_pct(inp: DipInput, window: int) -> float | None:
@@ -188,12 +206,13 @@ def _position(weight_pct: float | None, cap: float) -> tuple[float | None, bool]
 
 def _fundamental_hits(inp: DipInput, config: DipTriggerConfig) -> list[FundamentalEvent]:
     earliest = inp.as_of - timedelta(days=config.event_lookback_days)
+    latest = max(inp.news_as_of or inp.as_of, inp.as_of)
     return [
         event
         for event in inp.events or ()
         if event.symbol == canonical_symbol(inp.symbol)
         and event.kind in FUNDAMENTAL_EVENT_KINDS
-        and earliest <= event.occurred_on <= inp.as_of
+        and earliest <= event.occurred_on <= latest
     ]
 
 
@@ -257,10 +276,21 @@ def evaluate_dip(inp: DipInput, config: DipTriggerConfig | None = None) -> DipTr
         )
 
     window = config.window_days
-    drop = (closes[-1] / closes[-1 - window] - 1) * 100
+    if any(c is None for c in closes[-1 - window :]):
+        return result(
+            DipStatus.INSUFFICIENT_DATA,
+            reasons=[f"ราคาปิดขาดในช่วง {window} วันล่าสุด ประเมินไม่ได้"],
+        )
     daily = _returns(closes)
-    worst = min(daily[-window:])
-    z = _zscore(worst, daily[-window - config.lookback_days : -window])
+    window_returns = [r for r in daily[-window:] if r is not None]
+    baseline = [r for r in daily[-window - config.lookback_days : -window] if r is not None]
+    if len(baseline) < 2:
+        return result(DipStatus.INSUFFICIENT_DATA, reasons=["ข้อมูลย้อนหลังไม่พอคำนวณความผันผวน"])
+    drop = _window_return_pct(closes, window)
+    if drop is None:  # unreachable: window closes were checked above
+        return result(DipStatus.INSUFFICIENT_DATA, reasons=["ราคาปิดขาดในช่วงที่ประเมิน"])
+    worst = min(window_returns)
+    z = _zscore(worst, baseline)
     reasons = [f"ลง {drop:.1f}% ใน {window} วัน (z-score วันแย่สุด {z:.1f})"]
 
     if drop > -config.min_drop_pct + EPS or z > -config.min_zscore + EPS:
@@ -307,13 +337,12 @@ def format_alert_th(result: DipTriggerResult) -> str:
 
 def parse_yahoo_chart(
     payload: Mapping[str, Any], *, now: datetime | None = None
-) -> tuple[list[date], list[float], list[float | None]]:
+) -> tuple[list[date], list[float | None], list[float | None]]:
     """Daily bars from a Yahoo v8 chart response.
 
     Dates are calendar days in ``meta.exchangeTimezoneName`` (UTC if unknown).
-    Skips bars with no close, keeps a missing volume as ``None``, marks the bar
-    after a skipped one with volume ``None`` so the gap still blocks the volume
-    signal, and drops the last bar while its regular session
+    A bar with no close stays in place with close ``None`` (and its volume, often
+    ``None``), so windows count real sessions and gaps fail closed downstream. Drops the last bar while its regular session
     (``meta.currentTradingPeriod.regular``) is still open: that bar's close is
     only the latest trade and its volume is partial.
     """
@@ -338,19 +367,14 @@ def parse_yahoo_chart(
         stamps = stamps[:-1]
 
     dates: list[date] = []
-    closes: list[float] = []
+    closes: list[float | None] = []
     volumes: list[float | None] = []
-    gap = False
     for i, stamp in enumerate(stamps):
         close = raw_closes[i] if i < len(raw_closes) else None
-        if close is None:
-            gap = True
-            continue
         volume = raw_volumes[i] if i < len(raw_volumes) else None
         dates.append(datetime.fromtimestamp(stamp, tz=zone).date())
-        closes.append(float(close))
-        volumes.append(None if volume is None or gap else float(volume))
-        gap = False
-    if not closes:
+        closes.append(None if close is None else float(close))
+        volumes.append(None if volume is None else float(volume))
+    if not any(c is not None for c in closes):
         raise ValueError("chart response has no closes")
     return dates, closes, volumes

@@ -178,9 +178,10 @@ def test_ac11_parse_yahoo_chart_skips_null_bars():
 
     dates, closes, volumes = parse_yahoo_chart(payload)
 
-    assert closes == [100.0, 95.0]
-    assert volumes == [10.0, None]  # bar after a skipped one carries the gap (round 3)
-    assert len(dates) == 2 and dates[0] < dates[1]
+    # Round 4: a null close stays in place as None so windows count real sessions.
+    assert closes == [100.0, None, 95.0]
+    assert volumes == [10.0, None, 30.0]
+    assert len(dates) == 3 and dates[0] < dates[1] < dates[2]
 
 
 def test_ac11_parse_yahoo_chart_rejects_empty():
@@ -440,8 +441,8 @@ def test_dropped_null_close_bar_leaves_a_volume_gap():
 
     _, closes, volumes = parse_yahoo_chart(payload)
 
-    assert closes == [100.0, 95.0]
-    assert volumes == [10.0, None]  # the bar after the gap carries it, so the volume signal skips
+    assert closes == [100.0, None, 95.0]
+    assert volumes == [10.0, None, 30.0]  # the gap stays in place, so the volume span sees it
 
 
 def test_dates_use_the_exchange_timezone():
@@ -481,3 +482,75 @@ def test_unknown_timezone_falls_back_to_utc():
     dates, _, _ = parse_yahoo_chart(payload)
 
     assert dates == [date(2026, 11, 5)]
+
+
+# --- Codex review round 4 (2026-11-07) ---
+
+
+def test_missing_close_inside_the_window_fails_closed():
+    closes = _with_drop(0.10)
+    closes[-3] = None
+
+    result = evaluate_dip(_input(closes=closes))
+
+    assert result.status is DipStatus.INSUFFICIENT_DATA
+    assert any("ขาด" in r for r in result.reasons)
+
+
+def test_missing_close_in_the_lookback_is_tolerated():
+    closes = _with_drop(0.10)
+    closes[10] = None
+
+    result = evaluate_dip(_input(closes=closes))
+
+    assert result.status is DipStatus.TRIGGER
+
+
+def test_missing_benchmark_close_at_window_start_skips_signal():
+    bench = _with_drop(0.05)
+    bench[-4] = None
+    closes = _with_drop(0.10)
+
+    result = evaluate_dip(_input(closes=closes, benchmark_closes=bench))
+
+    assert "benchmark_down" not in result.forced_signals
+
+
+def test_news_after_the_last_bar_still_vetoes():
+    # Friday bar, Saturday warning, run on Saturday.
+    friday = date(2026, 11, 6)
+    saturday = friday + timedelta(days=1)
+    event = FundamentalEvent(symbol="SKH.KS", kind="company_news", occurred_on=saturday, title="profit warning")
+
+    result = evaluate_dip(_input(as_of=friday, news_as_of=saturday, events=[event]))
+
+    assert result.status is DipStatus.FUNDAMENTAL
+
+
+def test_news_as_of_defaults_to_price_date():
+    event = FundamentalEvent(symbol="SKH.KS", kind="earnings", occurred_on=AS_OF + timedelta(days=1))
+
+    result = evaluate_dip(_input(events=[event]))
+
+    assert result.status is DipStatus.TRIGGER
+
+
+def test_script_checks_news_up_to_today():
+    friday_bars = _fake_fetch(set())
+    saturday = AS_OF + timedelta(days=1)
+    event = FundamentalEvent(symbol="NVDA", kind="guidance", occurred_on=saturday)
+
+    result = asyncio.run(
+        dip_script.evaluate_symbol(
+            "NVDA",
+            fetch=friday_bars,
+            benchmark=None,
+            events=[event],
+            weights={},
+            margins={},
+            config=DipTriggerConfig(),
+            today=saturday,
+        )
+    )
+
+    assert result.status is DipStatus.FUNDAMENTAL

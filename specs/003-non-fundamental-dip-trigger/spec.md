@@ -64,10 +64,13 @@ headroom; at or over the cap it says "no room" (`at_cap=True`).
 | AC-17 | The script still evaluates the stock when only the benchmark fetch fails (benchmark signal dropped) | same |
 | AC-18 | CLI symbols and `--weights` / `--margin` keys are canonicalised before benchmark choice and lookups | same |
 
-| AC-19 | A bar skipped for a null close leaves the next bar's volume `None`, so the gap still blocks the volume signal | same |
+| AC-19 | A null-close bar stays in place as `None` (superseded the round-3 "mark the next bar" rule); the volume span sees the gap | same |
 | AC-20 | Bar dates are calendar days in `meta.exchangeTimezoneName` (UTC if unknown) | same |
 
-AC-12 to AC-20 came from three Codex review rounds on 2026-11-07. Red first each round (8, 6, then 2 new tests failed), then passed.
+| AC-21 | A missing close inside the window → `INSUFFICIENT_DATA`; gaps in the lookback are skipped; a missing benchmark endpoint skips that signal | same |
+| AC-22 | Events are searched up to `news_as_of` (the script passes today), so news after the last completed bar still vetoes | same |
+
+AC-12 to AC-22 came from four Codex review rounds on 2026-11-07. Red first each round (8, 6, 2, then 7 tests failed), then passed.
 
 ## 4. Out of scope (follow-up)
 

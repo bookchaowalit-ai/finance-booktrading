@@ -19,6 +19,7 @@ import asyncio
 import json
 import sys
 from collections.abc import Awaitable, Callable
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -77,11 +78,13 @@ async def evaluate_symbol(
     weights: dict,
     margins: dict,
     config: DipTriggerConfig,
+    today: date | None = None,
 ) -> DipTriggerResult | None:
     """Evaluate one symbol; None when the stock's own bars cannot be fetched.
 
     A benchmark failure only drops the benchmark signal; the stock is still evaluated.
     ``weights`` and ``margins`` must already be canonicalised (see ``canonical_keys``).
+    News is checked up to ``today`` (default: now), not just the last completed bar.
     """
     symbol = canonical_symbol(raw_symbol)
     try:
@@ -107,6 +110,7 @@ async def evaluate_symbol(
             benchmark_closes=bench_closes,
             dates=dates,
             benchmark_dates=bench_dates,
+            news_as_of=today or date.today(),
             events=events,
             margin_balance_before=margin.get("before"),
             margin_balance_now=margin.get("now"),
