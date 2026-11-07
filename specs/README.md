@@ -8,3 +8,4 @@ scenario is built test-first (ADR-0004 — TDD + SDD). Both live in the owner's 
 | Spec | Title | Status |
 |---|---|---|
 | [001](001-shared-ci-sentry-deps/spec.md) | Shared CI, Sentry, strategy lockfile and dependency security | implemented (2026-10-22) |
+| [003](003-non-fundamental-dip-trigger/spec.md) | Non-fundamental dip trigger (observe-only) | implemented (2026-11-07) |

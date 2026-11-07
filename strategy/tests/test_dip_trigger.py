@@ -1,0 +1,193 @@
+"""SPEC-003 — non-fundamental dip trigger (observe-only)."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+import pytest
+
+from app.market_intel.dip_trigger import (
+    DipInput,
+    DipStatus,
+    DipTriggerConfig,
+    FundamentalEvent,
+    evaluate_dip,
+    format_alert_th,
+    parse_yahoo_chart,
+)
+
+AS_OF = date(2026, 11, 6)
+
+
+def _calm(n: int, start: float = 100.0) -> list[float]:
+    """n closes that wiggle +/-0.5 % around a flat line."""
+    closes = [start]
+    for i in range(n - 1):
+        closes.append(closes[-1] * (1.005 if i % 2 == 0 else 0.995))
+    return closes
+
+
+def _with_drop(total_drop: float, calm_days: int = 61, window: int = 3) -> list[float]:
+    closes = _calm(calm_days)
+    step = (1 - total_drop) ** (1 / window)
+    for _ in range(window):
+        closes.append(closes[-1] * step)
+    return closes
+
+
+def _volumes(n: int, spike: float = 3.0, window: int = 3) -> list[float]:
+    base = [1_000_000.0] * (n - window)
+    return base + [1_000_000.0 * spike] * window
+
+
+def _input(**overrides) -> DipInput:
+    closes = overrides.pop("closes", _with_drop(0.10))
+    values = {
+        "symbol": "SKH.KS",
+        "as_of": AS_OF,
+        "closes": closes,
+        "volumes": _volumes(len(closes)),
+        "benchmark_closes": _with_drop(0.05),
+        "events": [],
+        "weight_pct": 5.0,
+    }
+    values.update(overrides)
+    return DipInput(**values)
+
+
+def test_ac1_forced_selling_dip_without_news_triggers():
+    result = evaluate_dip(_input())
+
+    assert result.status is DipStatus.TRIGGER
+    assert result.drop_pct == pytest.approx(-10.0, abs=0.01)
+    assert result.worst_zscore is not None and result.worst_zscore <= -2.0
+    assert set(result.forced_signals) == {"benchmark_down", "volume_spike"}
+
+
+def test_ac2_fundamental_event_blocks_the_signal():
+    event = FundamentalEvent(symbol="SKH.KS", kind="earnings", occurred_on=AS_OF - timedelta(days=2), title="Q3 miss")
+
+    result = evaluate_dip(_input(events=[event]))
+
+    assert result.status is DipStatus.FUNDAMENTAL
+    assert any("earnings" in reason and "Q3 miss" in reason for reason in result.reasons)
+
+
+def test_ac3_missing_event_data_needs_human_review():
+    result = evaluate_dip(_input(events=None))
+
+    assert result.status is DipStatus.NEEDS_REVIEW
+
+
+def test_ac4_small_drop_is_not_a_dip():
+    result = evaluate_dip(_input(closes=_with_drop(0.04)))
+
+    assert result.status is DipStatus.NO_DIP
+
+
+def test_ac5_drop_alone_without_forced_selling_evidence():
+    closes = _with_drop(0.10)
+    result = evaluate_dip(_input(closes=closes, volumes=[1_000_000.0] * len(closes), benchmark_closes=_calm(64)))
+
+    assert result.status is DipStatus.NO_FORCED_SELLING
+    assert result.forced_signals == ()
+
+
+def test_ac6_margin_drop_counts_as_forced_selling_evidence():
+    closes = _with_drop(0.10)
+    result = evaluate_dip(
+        _input(
+            closes=closes,
+            volumes=[1_000_000.0] * len(closes),
+            margin_balance_before=1_000.0,
+            margin_balance_now=850.0,
+        )
+    )
+
+    assert result.status is DipStatus.TRIGGER
+    assert set(result.forced_signals) == {"benchmark_down", "margin_unwind"}
+
+
+def test_ac7_short_history_is_insufficient():
+    closes = _with_drop(0.10, calm_days=20)
+
+    result = evaluate_dip(_input(closes=closes, volumes=_volumes(len(closes))))
+
+    assert result.status is DipStatus.INSUFFICIENT_DATA
+
+
+def test_ac8_position_cap_headroom():
+    over = evaluate_dip(_input(weight_pct=18.0))
+    under = evaluate_dip(_input(weight_pct=5.0))
+    unknown = evaluate_dip(_input(weight_pct=None))
+
+    assert over.at_cap is True
+    assert over.headroom_pct == 0.0
+    assert over.status is DipStatus.TRIGGER
+    assert under.at_cap is False
+    assert under.headroom_pct == pytest.approx(10.0)
+    assert unknown.headroom_pct is None and unknown.at_cap is False
+
+
+def test_ac8_custom_cap():
+    result = evaluate_dip(_input(weight_pct=5.0), DipTriggerConfig(max_position_pct=10.0))
+
+    assert result.headroom_pct == pytest.approx(5.0)
+
+
+def test_ac9_old_or_foreign_events_are_ignored():
+    events = [
+        FundamentalEvent(symbol="SKH.KS", kind="earnings", occurred_on=AS_OF - timedelta(days=30)),
+        FundamentalEvent(symbol="NVDA", kind="guidance", occurred_on=AS_OF),
+        FundamentalEvent(symbol="SKH.KS", kind="macro", occurred_on=AS_OF),
+    ]
+
+    result = evaluate_dip(_input(events=events))
+
+    assert result.status is DipStatus.TRIGGER
+
+
+def test_ac10_thai_alert_text():
+    text = format_alert_th(evaluate_dip(_input(weight_pct=5.0)))
+
+    assert "SKH.KS" in text
+    assert "TRIGGER" in text
+    assert "-10.0%" in text
+    assert "10.0%" in text  # headroom
+    assert "ไม่ใช่คำแนะนำการลงทุน" in text
+    assert "ไม่ได้ส่งคำสั่งซื้อ" in text
+
+
+def test_ac10_alert_says_no_room_at_cap():
+    text = format_alert_th(evaluate_dip(_input(weight_pct=20.0)))
+
+    assert "เต็มเพดาน" in text
+
+
+def test_ac11_parse_yahoo_chart_skips_null_bars():
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [1762300800, 1762387200, 1762473600],
+                    "indicators": {"quote": [{"close": [100.0, None, 95.0], "volume": [10, None, 30]}]},
+                }
+            ]
+        }
+    }
+
+    dates, closes, volumes = parse_yahoo_chart(payload)
+
+    assert closes == [100.0, 95.0]
+    assert volumes == [10.0, 30.0]
+    assert len(dates) == 2 and dates[0] < dates[1]
+
+
+def test_ac11_parse_yahoo_chart_rejects_empty():
+    with pytest.raises(ValueError):
+        parse_yahoo_chart({"chart": {"result": []}})
+
+
+def test_rejects_bad_prices():
+    with pytest.raises(ValueError):
+        evaluate_dip(_input(closes=[*_with_drop(0.10)[:-1], 0.0]))
