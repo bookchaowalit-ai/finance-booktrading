@@ -60,7 +60,11 @@ headroom; at or over the cap it says "no room" (`at_cap=True`).
 | AC-14 | Symbols are matched case- and space-insensitively (`nvda` == `NVDA`) | same |
 | AC-15 | Exact boundaries count: 100 → 92 is a −8 % drop; margin 1000 → 900 is −10 % (tolerance `EPS`) | same |
 
-AC-12 to AC-15 came from the Codex review on 2026-11-07. Red first: 8 new tests failed, then passed.
+| AC-16 | A missing volume stays `None`; any gap in the 20-day baseline or the window skips the volume signal | same |
+| AC-17 | The script still evaluates the stock when only the benchmark fetch fails (benchmark signal dropped) | same |
+| AC-18 | CLI symbols and `--weights` / `--margin` keys are canonicalised before benchmark choice and lookups | same |
+
+AC-12 to AC-18 came from two Codex review rounds on 2026-11-07. Red first each round (8, then 6 new tests failed), then passed.
 
 ## 4. Out of scope (follow-up)
 

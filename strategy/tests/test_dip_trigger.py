@@ -305,3 +305,119 @@ def test_exact_threshold_margin_counts():
     )
 
     assert "margin_unwind" in result.forced_signals
+
+
+# --- Codex review round 2 (2026-11-07) ---
+
+import asyncio  # noqa: E402
+import importlib.util  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "dip_trigger.py"
+_spec = importlib.util.spec_from_file_location("dip_trigger_script", _SCRIPT)
+dip_script = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dip_script)
+
+
+def test_parse_yahoo_chart_keeps_missing_volume_as_none():
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [1762300800, 1762387200],
+                    "indicators": {"quote": [{"close": [100.0, 95.0], "volume": [None, 30]}]},
+                }
+            ]
+        }
+    }
+
+    _, _, volumes = parse_yahoo_chart(payload)
+
+    assert volumes == [None, 30.0]
+
+
+def test_incomplete_volume_baseline_skips_the_volume_signal():
+    closes = _with_drop(0.10)
+    volumes = [None] * (len(closes) - 4) + [1_000_000.0] * 4
+
+    result = evaluate_dip(_input(closes=closes, volumes=volumes))
+
+    assert "volume_spike" not in result.forced_signals
+
+
+def _fake_fetch(fail: set[str]):
+    closes = _with_drop(0.10)
+    dates = _bdays(len(closes))
+    bench = _with_drop(0.05)
+
+    async def fetch(symbol: str):
+        if symbol in fail:
+            raise ValueError("boom")
+        if symbol.startswith("^") or symbol == "SPY":
+            return dates, bench, [1.0] * len(bench)
+        return dates, closes, _volumes(len(closes))
+
+    return fetch
+
+
+def test_benchmark_failure_still_evaluates_the_stock():
+    result = asyncio.run(
+        dip_script.evaluate_symbol(
+            "NVDA",
+            fetch=_fake_fetch({"SPY"}),
+            benchmark=None,
+            events=[],
+            weights={},
+            margins={"NVDA": {"before": 1000, "now": 800}},
+            config=DipTriggerConfig(),
+        )
+    )
+
+    assert result is not None
+    assert result.status is DipStatus.TRIGGER
+    assert set(result.forced_signals) == {"volume_spike", "margin_unwind"}
+
+
+def test_stock_fetch_failure_returns_none():
+    result = asyncio.run(
+        dip_script.evaluate_symbol(
+            "NVDA",
+            fetch=_fake_fetch({"NVDA"}),
+            benchmark=None,
+            events=[],
+            weights={},
+            margins={},
+            config=DipTriggerConfig(),
+        )
+    )
+
+    assert result is None
+
+
+def test_cli_symbols_are_canonicalised_for_benchmark_and_lookups():
+    seen: list[str] = []
+    inner = _fake_fetch(set())
+
+    async def fetch(symbol: str):
+        seen.append(symbol)
+        return await inner(symbol)
+
+    result = asyncio.run(
+        dip_script.evaluate_symbol(
+            " ptt.bk ",
+            fetch=fetch,
+            benchmark=None,
+            events=[],
+            weights={"PTT.BK": 12.0},
+            margins={},
+            config=DipTriggerConfig(),
+        )
+    )
+
+    assert seen == ["PTT.BK", "^SET.BK"]
+    assert result.symbol == "PTT.BK"
+    assert result.weight_pct == 12.0
+
+
+def test_mapping_keys_are_canonicalised():
+    assert dip_script.canonical_keys({" nvda ": 5}) == {"NVDA": 5}

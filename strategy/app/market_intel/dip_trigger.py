@@ -109,7 +109,7 @@ class DipInput:
     symbol: str
     as_of: date
     closes: Sequence[float]
-    volumes: Sequence[float] | None = None
+    volumes: Sequence[float | None] | None = None
     benchmark_closes: Sequence[float] | None = None
     events: Sequence[FundamentalEvent] | None = None
     margin_balance_before: float | None = None
@@ -209,10 +209,12 @@ def _forced_signals(inp: DipInput, config: DipTriggerConfig) -> tuple[list[str],
             signals.append("benchmark_down")
             reasons.append(f"ตลาด/กลุ่มลง {bench_pct:.1f}% ในช่วงเดียวกัน")
 
-    volumes = list(inp.volumes or ())
-    if len(volumes) >= window + VOLUME_BASELINE_DAYS:
-        baseline = fmean(volumes[-window - VOLUME_BASELINE_DAYS : -window])
-        peak = max(volumes[-window:])
+    # Any missing bar in the baseline or the window skips this signal: a gap read as zero would fake a spike.
+    span = list(inp.volumes or ())[-window - VOLUME_BASELINE_DAYS :]
+    if len(span) == window + VOLUME_BASELINE_DAYS and all(v is not None for v in span):
+        known = [float(v) for v in span if v is not None]
+        baseline = fmean(known[:-window])
+        peak = max(known[-window:])
         if baseline > 0 and peak / baseline >= config.min_volume_ratio - EPS:
             signals.append("volume_spike")
             reasons.append(f"วอลุ่มสูงสุด {peak / baseline:.1f}x ของค่าเฉลี่ย 20 วัน")
@@ -304,10 +306,10 @@ def format_alert_th(result: DipTriggerResult) -> str:
 
 def parse_yahoo_chart(
     payload: Mapping[str, Any], *, now: datetime | None = None
-) -> tuple[list[date], list[float], list[float]]:
+) -> tuple[list[date], list[float], list[float | None]]:
     """Daily bars from a Yahoo v8 chart response.
 
-    Skips bars with no close, and drops the last bar while its regular session
+    Skips bars with no close, keeps a missing volume as ``None``, and drops the last bar while its regular session
     (``meta.currentTradingPeriod.regular``) is still open: that bar's close is
     only the latest trade and its volume is partial.
     """
@@ -328,7 +330,7 @@ def parse_yahoo_chart(
 
     dates: list[date] = []
     closes: list[float] = []
-    volumes: list[float] = []
+    volumes: list[float | None] = []
     for i, stamp in enumerate(stamps):
         close = raw_closes[i] if i < len(raw_closes) else None
         if close is None:
@@ -336,7 +338,7 @@ def parse_yahoo_chart(
         volume = raw_volumes[i] if i < len(raw_volumes) else None
         dates.append(datetime.fromtimestamp(stamp, tz=UTC).date())
         closes.append(float(close))
-        volumes.append(float(volume or 0))
+        volumes.append(None if volume is None else float(volume))
     if not closes:
         raise ValueError("chart response has no closes")
     return dates, closes, volumes

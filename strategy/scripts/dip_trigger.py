@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -28,7 +29,9 @@ from app.market_intel.dip_trigger import (
     DipInput,
     DipStatus,
     DipTriggerConfig,
+    DipTriggerResult,
     FundamentalEvent,
+    canonical_symbol,
     evaluate_dip,
     format_alert_th,
     parse_yahoo_chart,
@@ -39,6 +42,7 @@ ALERT_STATUSES = {DipStatus.TRIGGER, DipStatus.NEEDS_REVIEW}
 
 
 def default_benchmark(symbol: str) -> str:
+    symbol = canonical_symbol(symbol)
     if symbol.endswith(".BK"):
         return "^SET.BK"
     if symbol.endswith((".KS", ".KQ")):
@@ -60,41 +64,84 @@ def _load(path: str | None, default):
     return json.loads(Path(path).read_text(encoding="utf-8")) if path else default
 
 
+def canonical_keys(mapping: dict) -> dict:
+    return {canonical_symbol(str(key)): value for key, value in mapping.items()}
+
+
+async def evaluate_symbol(
+    raw_symbol: str,
+    *,
+    fetch: Callable[[str], Awaitable[tuple[list, list, list]]],
+    benchmark: str | None,
+    events: list[FundamentalEvent] | None,
+    weights: dict,
+    margins: dict,
+    config: DipTriggerConfig,
+) -> DipTriggerResult | None:
+    """Evaluate one symbol; None when the stock's own bars cannot be fetched.
+
+    A benchmark failure only drops the benchmark signal; the stock is still evaluated.
+    ``weights`` and ``margins`` must already be canonicalised (see ``canonical_keys``).
+    """
+    symbol = canonical_symbol(raw_symbol)
+    try:
+        dates, closes, volumes = await fetch(symbol)
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"{symbol}: fetch failed ({exc})", file=sys.stderr)
+        return None
+
+    bench_symbol = canonical_symbol(benchmark) if benchmark else default_benchmark(symbol)
+    bench_dates = bench_closes = None
+    try:
+        bench_dates, bench_closes, _ = await fetch(bench_symbol)
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"{symbol}: benchmark {bench_symbol} fetch failed ({exc}); skipping that signal", file=sys.stderr)
+
+    margin = margins.get(symbol) or {}
+    return evaluate_dip(
+        DipInput(
+            symbol=symbol,
+            as_of=dates[-1],
+            closes=closes,
+            volumes=volumes,
+            benchmark_closes=bench_closes,
+            dates=dates,
+            benchmark_dates=bench_dates,
+            events=events,
+            margin_balance_before=margin.get("before"),
+            margin_balance_now=margin.get("now"),
+            weight_pct=weights.get(symbol),
+        ),
+        config,
+    )
+
+
 async def run(args: argparse.Namespace) -> int:
     events = None
     if args.events:
         events = [FundamentalEvent.from_mapping(raw) for raw in _load(args.events, [])]
-    weights = _load(args.weights, {})
-    margins = _load(args.margin, {})
+    weights = canonical_keys(_load(args.weights, {}))
+    margins = canonical_keys(_load(args.margin, {}))
     config = DipTriggerConfig(max_position_pct=args.cap)
 
     alerts: list[str] = []
     async with httpx.AsyncClient(timeout=15.0) as client:
-        for symbol in args.symbols:
-            benchmark = args.benchmark or default_benchmark(symbol)
-            try:
-                dates, closes, volumes = await fetch_chart(client, symbol)
-                bench_dates, bench_closes, _ = await fetch_chart(client, benchmark)
-            except (httpx.HTTPError, ValueError) as exc:
-                print(f"{symbol}: fetch failed ({exc})", file=sys.stderr)
-                continue
-            margin = margins.get(symbol) or {}
-            result = evaluate_dip(
-                DipInput(
-                    symbol=symbol,
-                    as_of=dates[-1],
-                    closes=closes,
-                    volumes=volumes,
-                    benchmark_closes=bench_closes,
-                    dates=dates,
-                    benchmark_dates=bench_dates,
-                    events=events,
-                    margin_balance_before=margin.get("before"),
-                    margin_balance_now=margin.get("now"),
-                    weight_pct=weights.get(symbol),
-                ),
-                config,
+
+        async def fetch(symbol: str):
+            return await fetch_chart(client, symbol)
+
+        for raw_symbol in args.symbols:
+            result = await evaluate_symbol(
+                raw_symbol,
+                fetch=fetch,
+                benchmark=args.benchmark,
+                events=events,
+                weights=weights,
+                margins=margins,
+                config=config,
             )
+            if result is None:
+                continue
             text = format_alert_th(result)
             print(text, end="\n\n")
             if result.status in ALERT_STATUSES:
