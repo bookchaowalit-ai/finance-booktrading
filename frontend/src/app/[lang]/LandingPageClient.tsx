@@ -571,6 +571,8 @@ export default function LandingPageClient({ lang }: { lang: string }) {
               <h4 className="text-white font-semibold mb-4">{t(lang, 'footer_company')}</h4>
               <ul className="space-y-2 text-gray-400 text-sm">
                 <li><a href="#contact" className="inline-flex min-h-[24px] items-center hover:text-white transition">{t(lang, 'nav_contact')}</a></li>
+                <li><a href="https://bookchaowalit.com/privacy" className="inline-flex min-h-[24px] items-center hover:text-white transition">{lang === 'th' ? 'ความเป็นส่วนตัว' : 'Privacy'}</a></li>
+                <li><a href="https://monitor.bookchaowalit.com/" className="inline-flex min-h-[24px] items-center hover:text-white transition">{lang === 'th' ? 'สถานะระบบ' : 'Status'}</a></li>
                 <li>
                   <button onClick={() => setLoginOpen(true)} className="inline-flex min-h-[24px] items-center hover:text-white transition">
                     {t(lang, 'nav_login')}

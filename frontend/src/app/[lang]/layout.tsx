@@ -14,6 +14,13 @@ export function generateStaticParams() {
 export const metadata = {
   title: 'BookFinance',
   description: 'Rule-based, paper-first crypto trading bots',
+  metadataBase: new URL('https://booktrading.bookchaowalit.com'),
+  openGraph: {
+    type: 'website',
+    siteName: 'BookFinance',
+    title: 'BookFinance — rule-based, paper-first crypto trading bots',
+    description: 'Rule-based trading bots that run on paper first, with kill switches before any real execution.',
+  },
 };
 
 interface LocaleLayoutProps {
