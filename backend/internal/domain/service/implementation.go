@@ -344,9 +344,17 @@ type BotServiceImpl struct {
 	orderLookup func(symbol string) gridExchange
 	// exchangeName returns the current provider (a test seam; nil = the
 	// exchange manager's).
-	exchangeName   func() string
-	runJoined      chan struct{}
-	runSeq         uint64 // runs started; guarded by runningMu
+	exchangeName func() string
+	// marketListed checks the exchange lists a Start symbol before it is
+	// recorded (a test seam; nil = the exchange manager's check, or none).
+	marketListed func(ctx context.Context, exchange, symbol string) error
+	runJoined    chan struct{}
+	runSeq       uint64 // runs started; guarded by runningMu
+	// startsPending counts Starts in their market lookup and stopSeq counts
+	// Stop calls (both guarded by runningMu): a Stop during the lookup
+	// cancels that Start, and status reports a pending Start as active.
+	startsPending  int
+	stopSeq        uint64
 	stopPending    bool
 	stopFinalizing bool
 	startedAt      time.Time
@@ -480,8 +488,31 @@ func withSignalDefaults(cfg input.SignalConfig) input.SignalConfig {
 
 // Start starts the trading bot with optional grid trading parameters
 func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams) error {
+	// A recorded symbol stays in every kill switch drain, so only a market
+	// the exchange lists is recorded. The lookup runs before runningMu so
+	// status reads are not held behind it.
+	s.runningMu.Lock()
+	s.startsPending++
+	stopSeqBefore := s.stopSeq
+	checkedExchange := s.exchangeLocked()
+	s.runningMu.Unlock()
+	defer func() {
+		s.runningMu.Lock()
+		s.startsPending--
+		s.runningMu.Unlock()
+	}()
+	if err := s.checkStartMarket(ctx, params, checkedExchange); err != nil {
+		return err
+	}
+
 	s.runningMu.Lock()
 	defer s.runningMu.Unlock()
+	if s.stopSeq != stopSeqBefore {
+		return fmt.Errorf("bot was stopped during start")
+	}
+	if s.exchangeLocked() != checkedExchange {
+		return fmt.Errorf("exchange changed during start, retry")
+	}
 
 	if s.isRunning {
 		return fmt.Errorf("bot is already running")
@@ -505,14 +536,7 @@ func (s *BotServiceImpl) Start(ctx context.Context, params *input.BotStartParams
 	// Traded symbols accumulate (and persist across restarts): an earlier
 	// run's orders may still be open, so a new Start never drops them from
 	// the kill switch's drain list. No symbol record, no run.
-	startSymbol := ""
-	if params != nil {
-		startSymbol = params.Symbol
-	}
-	if mode == model.BotModeAuto && params != nil {
-		startSymbol = autoModeSymbol(params.SignalConfig)
-	}
-	if err := s.noteTradedSymbol(ctx, startSymbol, s.exchangeLocked()); err != nil {
+	if err := s.noteTradedSymbol(ctx, startSymbol(params, mode), checkedExchange); err != nil {
 		if rbErr := s.botStatusRepo.SetActive(ctx, false); rbErr != nil {
 			logger.Error("Failed to roll back bot status", "error", rbErr)
 		}
@@ -633,6 +657,38 @@ var ErrBotStopTimeout = errors.New("bot stop: trading loop did not exit in time"
 var botStopJoinTimeout = 30 * time.Second
 
 // autoModeSymbol is the symbol an auto-mode run trades.
+// startSymbol is the symbol a Start records for the kill switch.
+func startSymbol(params *input.BotStartParams, mode model.BotMode) string {
+	if params == nil {
+		return ""
+	}
+	if mode == model.BotModeAuto {
+		return autoModeSymbol(params.SignalConfig)
+	}
+	return params.Symbol
+}
+
+func (s *BotServiceImpl) checkStartMarket(ctx context.Context, params *input.BotStartParams, exchangeName string) error {
+	symbol := startSymbol(params, resolveBotMode(params))
+	if symbol == "" {
+		return nil
+	}
+	check := s.marketListed
+	if check == nil && s.exchangeManager != nil {
+		manager := s.exchangeManager
+		check = func(ctx context.Context, exchangeName, symbol string) error {
+			return manager.MarketListed(ctx, config.ExchangeProvider(exchangeName), symbol)
+		}
+	}
+	if check == nil {
+		return nil
+	}
+	if err := check(ctx, exchangeName, symbol); err != nil {
+		return fmt.Errorf("symbol %s not available on %s: %w", symbol, exchangeName, err)
+	}
+	return nil
+}
+
 func autoModeSymbol(cfg input.SignalConfig) string {
 	if cfg.Symbol == "" {
 		return "BTCUSDT"
@@ -936,6 +992,7 @@ func (s *BotServiceImpl) goLoop(fn func()) {
 // runningMu, so the wait happens after the lock is released.
 func (s *BotServiceImpl) Stop(ctx context.Context) error {
 	s.runningMu.Lock()
+	s.stopSeq++
 	switch {
 	case s.isRunning:
 		s.cancel()
@@ -1021,7 +1078,7 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 	// one active or still stopping now is reported active, so a kill switch
 	// comparing counters never takes an older symbol list as complete.
 	s.runningMu.RLock()
-	seqBefore, busyBefore := s.runSeq, s.isRunning || s.stopPending
+	seqBefore, busyBefore := s.runSeq, s.isRunning || s.stopPending || s.startsPending > 0
 	s.runningMu.RUnlock()
 	// Fewer symbols than were traded would let the kill switch skip live
 	// orders, so an unreadable list fails the status read.
@@ -1040,8 +1097,9 @@ func (s *BotServiceImpl) GetStatus(ctx context.Context) (*model.BotStatus, error
 
 	s.runningMu.RLock()
 	// A run that started during the read may have placed orders after a
-	// drain: report it active, keeping the pre-read counter for the list.
-	status.IsActive = s.isRunning || busyBefore || s.runSeq != seqBefore
+	// drain, and a Start still in its market lookup may begin trading after
+	// it: report both active, keeping the pre-read counter for the list.
+	status.IsActive = s.isRunning || busyBefore || s.runSeq != seqBefore || s.startsPending > 0 || s.stopPending
 	status.RunSeq = seqBefore
 	// Include trading stats if available
 	status.TotalTrades = s.botStatus.TotalTrades

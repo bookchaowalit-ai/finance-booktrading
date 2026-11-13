@@ -442,3 +442,97 @@ func TestStatusActiveIfRunningWhenTheReadBegan(t *testing.T) {
 		t.Fatal("a run that was active at the start of the read must be reported active")
 	}
 }
+
+// A Start symbol the exchange does not list is refused before it is
+// recorded: every later kill would try to drain it and fail.
+func TestStartRefusesUnlistedSymbolBeforeRecording(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.exchangeName = func() string { return "binance_th" }
+	var checked []string
+	s.marketListed = func(_ context.Context, exchange, symbol string) error {
+		checked = append(checked, symbol+"@"+exchange)
+		return errors.New("not listed")
+	}
+	params := validGrid()
+	if err := s.Start(context.Background(), params); err == nil {
+		s.Stop(context.Background())
+		t.Fatal("Start must fail for an unlisted symbol")
+	}
+	if len(checked) != 1 || checked[0] != params.Symbol+"@binance_th" {
+		t.Fatalf("checked %v", checked)
+	}
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Symbols) != 0 || st.IsActive {
+		t.Fatalf("unlisted symbol recorded or bot active: %v %v", st.Symbols, st.IsActive)
+	}
+}
+
+// A Stop while Start waits on its market lookup wins: the Start must not
+// begin trading after it, and status reports the pending Start as active
+// so a kill switch never takes it for contained.
+func TestStopDuringStartMarketCheckCancelsTheStart(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.exchangeName = func() string { return "binance_th" }
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.marketListed = func(context.Context, string, string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	started := make(chan error, 1)
+	go func() { started <- s.Start(context.Background(), validGrid()) }()
+	<-entered
+
+	st, err := s.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.IsActive {
+		t.Fatal("pending Start reported inactive")
+	}
+	_ = s.Stop(context.Background())
+	close(release)
+	if err := <-started; err == nil {
+		s.Stop(context.Background())
+		t.Fatal("Start went ahead after a Stop")
+	}
+	if s.IsRunning(context.Background()) {
+		t.Fatal("bot running after Stop")
+	}
+}
+
+// A Start that enters its market lookup while status reads the symbols is
+// reported active by that same status read.
+func TestStartPendingDuringStatusReadIsActive(t *testing.T) {
+	repo := &symbolStoreRepo{}
+	s := NewBotService(repo, &MockRedisPublisher{}, &MockWebSocketBroadcaster{})
+	s.exchangeName = func() string { return "binance_th" }
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.marketListed = func(context.Context, string, string) error {
+		close(entered)
+		<-release
+		return errors.New("not listed")
+	}
+	started := make(chan error, 1)
+	var once sync.Once
+	repo.onList = func() {
+		once.Do(func() {
+			go func() { started <- s.Start(context.Background(), validGrid()) }()
+			<-entered
+		})
+	}
+	st, err := s.GetStatus(context.Background())
+	close(release)
+	<-started
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.IsActive {
+		t.Fatal("Start pending during the read reported inactive")
+	}
+}

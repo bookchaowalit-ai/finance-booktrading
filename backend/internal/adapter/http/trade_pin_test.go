@@ -151,7 +151,7 @@ func TestListedMarketNeedsAMatchingPricedTicker(t *testing.T) {
 		{"error", nil, errors.New("down"), false},
 	}
 	for _, c := range cases {
-		if got := listedMarket("BTCUSDT", c.ticker, c.err) == nil; got != c.ok {
+		if got := exchange.ListedMarket("BTCUSDT", c.ticker, c.err) == nil; got != c.ok {
 			t.Errorf("%s: ok=%v", c.name, got)
 		}
 	}

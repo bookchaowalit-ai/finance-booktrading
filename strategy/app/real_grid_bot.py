@@ -126,6 +126,9 @@ class RealGridState:
     booked_sells: Dict[str, tuple] = field(default_factory=dict)
     # order_id -> executed qty already added to a lot for a cancelled BUY; not persisted
     booked_buys: Dict[str, float] = field(default_factory=dict)
+    # order_id -> base qty a SELL was placed for: what it sold when the
+    # exchange does not say (a lot can hold more than one order's size)
+    sell_order_qty: Dict[str, float] = field(default_factory=dict)
 
 
 # ── Per-symbol default configs ────────────────────────────────────────────────
@@ -401,6 +404,7 @@ class RealGridBot:
                 # Booking ledgers: a restart must not book a fill twice.
                 "booked_sells": {k: list(v) for k, v in state.booked_sells.items()},
                 "booked_buys": dict(state.booked_buys),
+                "sell_order_qty": dict(state.sell_order_qty),
                 # Cancels awaiting their real outcome: after a restart they
                 # are the only reference to orders already off the book.
                 "unresolved_cancels": [
@@ -461,6 +465,7 @@ class RealGridBot:
             state.lot_qty = {float(k): v for k, v in data.get("lot_qty", {}).items()}
             state.booked_sells = {str(k): tuple(v) for k, v in data.get("booked_sells", {}).items()}
             state.booked_buys = {str(k): v for k, v in data.get("booked_buys", {}).items()}
+            state.sell_order_qty = {str(k): float(v) for k, v in data.get("sell_order_qty", {}).items()}
             for oid, side, price, stop_lot in data.get("unresolved_cancels", []):
                 self._unresolved_cancels.setdefault((symbol, str(oid)), (side, price, stop_lot))
             for u in data.get("uncertain_submissions", []):
@@ -704,8 +709,12 @@ class RealGridBot:
             pieces.append((0.0, remaining))
         return pieces, stops
 
-    def _expected_sell_qty(self, state: RealGridState, sell_price: float) -> float:
-        """What a SELL sold when the exchange did not say: its first lot's size."""
+    def _expected_sell_qty(self, state: RealGridState, sell_price: float, order_id: Optional[str] = None) -> float:
+        """What a SELL sold when the exchange did not say: the size it was
+        placed for, else (state from before sizes were kept) its first lot's."""
+        placed = state.sell_order_qty.get(order_id) if order_id else None
+        if placed:
+            return placed
         lots = self._lot_order(state, sell_price)
         return self._lot_quantity(state, lots[0]) if lots else self._lot_quantity(state, 0.0)
 
@@ -1286,6 +1295,13 @@ class RealGridBot:
                 if pinned_exchange and (after.get("exchange") or "") != pinned_exchange:
                     logger.error("Kill: exchange changed from %s to %s during containment", pinned_exchange, after.get("exchange"))
                     result["failed"].append({"symbol": None, "orderId": None, "reason": "exchange_changed", "exchange": after.get("exchange")})
+                # An in-flight Python order pinned to another exchange may be
+                # recorded only after the first read.
+                reported = {f.get("exchange") for f in result["failed"] if f.get("reason") == "other_exchange"}
+                for other in after.get("traded_exchanges") or []:
+                    if other != pinned_exchange and other not in reported:
+                        logger.error("Kill: %s was traded during containment; this drain only reached %s", other, pinned_exchange)
+                        result["failed"].append({"symbol": None, "orderId": None, "reason": "other_exchange", "exchange": other})
             except Exception as e:
                 logger.error("Kill: Go bot status after the drain unavailable: %s", e)
                 result["failed"].append({"symbol": None, "orderId": None, "reason": "go_status"})
@@ -1777,7 +1793,7 @@ class RealGridBot:
                 # Book the sell against the lots it sold, sized by what it
                 # actually executed (a smaller fill shrinks its lot).
                 executed = await self._final_executed_qty(self._http, cfg.symbol, oid)
-                qty = executed if executed and executed > 0 else self._expected_sell_qty(state, sell_price)
+                qty = executed if executed and executed > 0 else self._expected_sell_qty(state, sell_price, oid)
                 booking = await self._realize_sell(state, sell_price, qty, oid, "FILLED_SELL")
                 if booking is None:
                     # Already booked (e.g. by a containment that cancelled it).
@@ -2857,6 +2873,9 @@ class RealGridBot:
                     state.active_buys[price] = order_id
                 else:
                     state.active_sells[price] = order_id
+                    state.sell_order_qty[order_id] = order_size
+                    while len(state.sell_order_qty) > 500:
+                        state.sell_order_qty.pop(next(iter(state.sell_order_qty)))
 
                 # Track order placement time for time-based stale cancellation
                 state.order_times[order_id] = time.time()
