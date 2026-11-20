@@ -16,7 +16,7 @@ describe('BackendOfflineBanner', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ status: 502, ok: false })
-      .mockResolvedValue({ status: 200, ok: true });
+      .mockResolvedValue({ status: 200, ok: true, json: async () => ({ status: 'healthy' }) });
     vi.stubGlobal('fetch', fetchMock);
     render(<BackendOfflineBanner lang="th" />);
     expect(await screen.findByRole('status')).toBeInTheDocument();
@@ -26,7 +26,7 @@ describe('BackendOfflineBanner', () => {
   });
 
   it('renders nothing when the backend is healthy', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true });
+    const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ status: 'healthy' }) });
     vi.stubGlobal('fetch', fetchMock);
     render(<BackendOfflineBanner lang="en" />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());

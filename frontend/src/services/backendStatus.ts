@@ -11,7 +11,10 @@ export type BackendState = 'checking' | 'online' | 'offline';
 
 // Same base URL as auth.ts and api.ts: a direct backend when
 // NEXT_PUBLIC_API_URL is set, otherwise the same-origin /api rewrite.
-const HEALTH_URL = `${process.env.NEXT_PUBLIC_API_URL || ''}/api/health`;
+// Read at call time so tests (and dev setups) can vary it.
+function healthUrl(): string {
+  return `${process.env.NEXT_PUBLIC_API_URL || ''}/api/health`;
+}
 const CHECK_TIMEOUT_MS = 5000;
 export const RECHECK_INTERVAL_MS = 30000;
 
@@ -50,13 +53,19 @@ export function isNetworkError(err: unknown): boolean {
   return err instanceof TypeError;
 }
 
-/** One quick probe of the public health route: no retries, short timeout. */
+/**
+ * One quick probe of the public health route: no retries, short timeout.
+ * Online only when the Go health handler itself answered ({"status":"healthy"}),
+ * so a proxy 404 or an HTML fallback page served with 200 counts as offline.
+ */
 export async function checkBackend(fetchImpl: typeof fetch = fetch): Promise<Exclude<BackendState, 'checking'>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
   try {
-    const res = await fetchImpl(HEALTH_URL, { cache: 'no-store', signal: controller.signal });
-    return isBackendDownStatus(res.status) ? 'offline' : 'online';
+    const res = await fetchImpl(healthUrl(), { cache: 'no-store', signal: controller.signal });
+    if (!res.ok) return 'offline';
+    const body = await res.json();
+    return body?.status === 'healthy' ? 'online' : 'offline';
   } catch {
     return 'offline';
   } finally {

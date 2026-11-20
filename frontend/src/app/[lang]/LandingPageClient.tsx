@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import LoginModal from '@/components/LoginModal';
+import { fetchLiveStats, type LiveStats } from '@/services/liveStats';
 import BackendOfflineBanner from '@/components/BackendOfflineBanner';
 import LanguageSelector from '@/components/LanguageSelector';
 
@@ -139,14 +140,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [contactSent, setContactSent] = useState(false);
-  const [liveStats, setLiveStats] = useState<{
-    paperPnl: number;
-    paperTrades: number;
-    polyPnl: number;
-    polyTrades: number;
-    arbScans: number;
-    botsRunning: number;
-  } | null>(null);
+  const [liveStats, setLiveStats] = useState<LiveStats | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -157,39 +151,21 @@ export default function LandingPageClient({ lang }: { lang: string }) {
 
   // Fetch live bot stats for portfolio proof
   useEffect(() => {
-    const fetchLiveStats = async () => {
-      try {
-        const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
-        const STRATEGY_API = process.env.NEXT_PUBLIC_STRATEGY_URL || '/strategy-api';
-        const token = typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null;
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-
-        const [paperRes, polyRes, arbRes] = await Promise.allSettled([
-          fetch(`${API_BASE}/api/paper/portfolio`, { headers }).then(r => r.json()),
-          fetch(`${STRATEGY_API}/api/poly-paper/performance`, { headers }).then(r => r.json()),
-          fetch(`${STRATEGY_API}/api/arb-paper/status`, { headers }).then(r => r.json()),
-        ]);
-
-        const paperData = paperRes.status === 'fulfilled' ? paperRes.value : null;
-        const polyData = polyRes.status === 'fulfilled' ? polyRes.value : null;
-        const arbData = arbRes.status === 'fulfilled' ? arbRes.value : null;
-
-        setLiveStats({
-          paperPnl: paperData?.total_pnl || paperData?.net_pnl || 0,
-          paperTrades: paperData?.total_trades || paperData?.trade_count || 0,
-          polyPnl: polyData?.total_pnl || 0,
-          polyTrades: polyData?.total_trades || 0,
-          arbScans: arbData?.scan_count || 0,
-          botsRunning: (arbData?.running ? 1 : 0) + (paperData?.running ? 1 : 0),
+    let cancelled = false;
+    const load = () =>
+      fetchLiveStats()
+        .then((stats) => {
+          if (!cancelled) setLiveStats(stats);
+        })
+        .catch(() => {
+          if (!cancelled) setLiveStats(null);
         });
-      } catch {
-        // Silently fail — stats are optional
-      }
+    load();
+    const interval = setInterval(load, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
     };
-    fetchLiveStats();
-    const interval = setInterval(fetchLiveStats, 60000);
-    return () => clearInterval(interval);
   }, []);
 
   const handleContactSubmit = (e: React.FormEvent) => {
@@ -365,47 +341,57 @@ export default function LandingPageClient({ lang }: { lang: string }) {
       <section className="py-16 px-6 bg-slate-900/30 border-y border-slate-800">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-10">
-            <div className="inline-flex items-center gap-2 bg-green-600/10 text-green-400 text-sm font-medium px-4 py-1.5 rounded-full border border-green-500/30 mb-4">
-              <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-              {lang === 'th' ? 'ระบบทำงานอยู่' : 'Systems Live'}
-            </div>
+            {/* "Live" only once a source has actually answered; otherwise say the data is unavailable. */}
+            {liveStats ? (
+              <div className="inline-flex items-center gap-2 bg-green-600/10 text-green-400 text-sm font-medium px-4 py-1.5 rounded-full border border-green-500/30 mb-4">
+                <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                {lang === 'th' ? 'ได้รับข้อมูลสดแล้ว' : 'Live data received'}
+              </div>
+            ) : (
+              <div className="inline-flex items-center gap-2 bg-slate-700/40 text-gray-300 text-sm font-medium px-4 py-1.5 rounded-full border border-slate-600 mb-4">
+                <span className="w-2 h-2 bg-gray-400 rounded-full" />
+                {lang === 'th' ? 'ข้อมูลสดยังไม่พร้อม' : 'Live data unavailable'}
+              </div>
+            )}
             <h2 className="text-3xl font-bold mb-2">
               {lang === 'th' ? 'ประสิทธิภาพเรียลไทม์' : 'Real-Time Performance'}
             </h2>
             <p className="text-gray-400">
-              {lang === 'th' ? 'ข้อมูลสดจากบอทเทรดที่กำลังทำงาน' : 'Live data from actively running trading bots'}
+              {liveStats
+                ? (lang === 'th' ? 'ข้อมูลสดจากบอทเทรดแบบ paper' : 'Live data from the paper-trading bots')
+                : (lang === 'th' ? 'ดึงข้อมูลบอทไม่ได้ตอนนี้ ตัวเลขด้านล่างจึงยังไม่ทราบ' : 'Bot data cannot be fetched right now, so the figures below are unknown')}
             </p>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             {[
               {
                 label: lang === 'th' ? 'Grid P&L' : 'Grid P&L',
-                value: liveStats ? `$${liveStats.paperPnl.toFixed(2)}` : '—',
-                color: liveStats && liveStats.paperPnl >= 0 ? 'text-green-400' : 'text-red-400',
+                value: liveStats?.paperPnl != null ? `$${liveStats.paperPnl.toFixed(2)}` : '—',
+                color: liveStats?.paperPnl == null ? 'text-gray-400' : liveStats.paperPnl >= 0 ? 'text-green-400' : 'text-red-400',
               },
               {
                 label: lang === 'th' ? 'Grid Trades' : 'Grid Trades',
-                value: liveStats ? String(liveStats.paperTrades) : '—',
+                value: liveStats?.paperTrades != null ? String(liveStats.paperTrades) : '—',
                 color: 'text-purple-400',
               },
               {
                 label: lang === 'th' ? 'Poly P&L' : 'Poly P&L',
-                value: liveStats ? `$${liveStats.polyPnl.toFixed(2)}` : '—',
-                color: liveStats && liveStats.polyPnl >= 0 ? 'text-green-400' : 'text-red-400',
+                value: liveStats?.polyPnl != null ? `$${liveStats.polyPnl.toFixed(2)}` : '—',
+                color: liveStats?.polyPnl == null ? 'text-gray-400' : liveStats.polyPnl >= 0 ? 'text-green-400' : 'text-red-400',
               },
               {
                 label: lang === 'th' ? 'Poly Trades' : 'Poly Trades',
-                value: liveStats ? String(liveStats.polyTrades) : '—',
+                value: liveStats?.polyTrades != null ? String(liveStats.polyTrades) : '—',
                 color: 'text-blue-400',
               },
               {
                 label: lang === 'th' ? 'Arb Scans' : 'Arb Scans',
-                value: liveStats ? String(liveStats.arbScans) : '—',
+                value: liveStats?.arbScans != null ? String(liveStats.arbScans) : '—',
                 color: 'text-amber-400',
               },
               {
                 label: lang === 'th' ? 'Bots Active' : 'Bots Active',
-                value: liveStats ? `${liveStats.botsRunning}/3` : '—',
+                value: liveStats?.botsRunning != null ? `${liveStats.botsRunning}/3` : '—',
                 color: 'text-emerald-400',
               },
             ].map((stat) => (

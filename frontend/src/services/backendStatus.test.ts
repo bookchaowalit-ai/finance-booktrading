@@ -1,7 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { checkBackend, backendOfflineMessage, isBackendDownStatus, isBackendUnreachableStatus, offlineErrorForStatus, isNetworkError } from './backendStatus';
 
-const res = (status: number) => ({ status, ok: status >= 200 && status < 300 }) as Response;
+const res = (status: number, body: unknown = { status: 'healthy' }) =>
+  ({ status, ok: status >= 200 && status < 300, json: async () => body }) as Response;
+
+afterEach(() => vi.unstubAllEnvs());
 
 describe('isBackendDownStatus', () => {
   it('treats gateway and server errors as down', () => {
@@ -20,10 +23,25 @@ describe('isBackendUnreachableStatus', () => {
 });
 
 describe('checkBackend', () => {
-  it('is online when /api/health answers 200', async () => {
+  it('is online when /api/health answers the backend health body', async () => {
+    vi.stubEnv('NEXT_PUBLIC_API_URL', '');
     const fetchImpl = vi.fn().mockResolvedValue(res(200));
     await expect(checkBackend(fetchImpl)).resolves.toBe('online');
     expect(fetchImpl).toHaveBeenCalledWith('/api/health', expect.objectContaining({ cache: 'no-store' }));
+  });
+
+  it('calls the backend directly when NEXT_PUBLIC_API_URL is set', async () => {
+    vi.stubEnv('NEXT_PUBLIC_API_URL', 'http://localhost:8080');
+    const fetchImpl = vi.fn().mockResolvedValue(res(200));
+    await checkBackend(fetchImpl);
+    expect(fetchImpl).toHaveBeenCalledWith('http://localhost:8080/api/health', expect.anything());
+  });
+
+  it('is offline when something other than the backend answers (proxy 404, HTML fallback)', async () => {
+    await expect(checkBackend(vi.fn().mockResolvedValue(res(404, {})))).resolves.toBe('offline');
+    const html = { status: 200, ok: true, json: async () => { throw new SyntaxError('Unexpected token <'); } } as unknown as Response;
+    await expect(checkBackend(vi.fn().mockResolvedValue(html))).resolves.toBe('offline');
+    await expect(checkBackend(vi.fn().mockResolvedValue(res(200, { status: 'ok' })))).resolves.toBe('offline');
   });
 
   it('is offline when the proxy answers 502 (no backend host)', async () => {
