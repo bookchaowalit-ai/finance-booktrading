@@ -20,6 +20,7 @@ import { Dropdown } from '@/components/ui';
 import NotificationCenter from '@/components/NotificationCenter';
 import FillNotificationToast from '@/components/FillNotificationToast';
 import ForbiddenNotice from '@/components/ForbiddenNotice';
+import BackendOfflineBanner from '@/components/BackendOfflineBanner';
 import MobileBottomNav from '@/components/MobileBottomNav';
 import KeyboardShortcutsHelp from '@/components/KeyboardShortcutsHelp';
 import { api } from '@/services/api';
@@ -244,6 +245,7 @@ export default function DashboardLayout({
 
             {/* Page Content - Scrollable. Skip-link target: lands after the top nav, not on it. */}
             <div id="main-content" tabIndex={-1} className="p-4 pb-20 lg:p-6 outline-none">
+              <BackendOfflineBanner lang={locale} className="mb-4" />
               <ErrorBoundary>
                 {children}
               </ErrorBoundary>

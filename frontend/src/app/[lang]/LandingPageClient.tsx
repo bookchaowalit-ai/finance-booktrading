@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import LoginModal from '@/components/LoginModal';
+import BackendOfflineBanner from '@/components/BackendOfflineBanner';
 import LanguageSelector from '@/components/LanguageSelector';
 
 // ─── Translations ─────────────────────────────────────────────────────────────
@@ -315,6 +316,7 @@ export default function LandingPageClient({ lang }: { lang: string }) {
         <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-purple-600/20 rounded-full blur-3xl pointer-events-none" />
 
         <div className="max-w-4xl mx-auto text-center relative">
+          <BackendOfflineBanner lang={lang} className="mb-8" />
           <span className="inline-block bg-purple-600/20 text-purple-400 text-sm font-medium px-4 py-1.5 rounded-full border border-purple-500/30 mb-6">
             {t(lang, 'hero_badge')}
           </span>

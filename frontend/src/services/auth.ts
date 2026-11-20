@@ -3,6 +3,8 @@
  * Connects to backend /api/auth endpoints
  */
 
+import { backendOfflineMessage, currentLocale, isBackendDownStatus } from './backendStatus';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '';
 
 export interface User {
@@ -34,6 +36,10 @@ export async function authenticate(email: string, password: string): Promise<Aut
     });
     clearTimeout(timeout);
 
+    if (isBackendDownStatus(response.status)) {
+      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    }
+
     if (!response.ok) {
       const data = await response.json().catch(() => ({ error: 'Invalid email or password' }));
       return { success: false, error: data.error || 'Invalid email or password' };
@@ -50,7 +56,7 @@ export async function authenticate(email: string, password: string): Promise<Aut
     if (err instanceof Error && err.name === 'AbortError') {
       return { success: false, error: 'Request timed out. Please try again.' };
     }
-    return { success: false, error: 'Unable to connect to server' };
+    return { success: false, error: backendOfflineMessage(currentLocale()) };
   }
 }
 
@@ -118,6 +124,10 @@ export async function register(
     });
     clearTimeout(timeout);
 
+    if (isBackendDownStatus(response.status)) {
+      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    }
+
     if (!response.ok) {
       const data = await response.json().catch(() => ({ error: 'Registration failed' }));
       if (response.status === 403) {
@@ -140,7 +150,7 @@ export async function register(
     if (err instanceof Error && err.name === 'AbortError') {
       return { success: false, error: 'Request timed out. Please try again.' };
     }
-    return { success: false, error: 'Unable to connect to server' };
+    return { success: false, error: backendOfflineMessage(currentLocale()) };
   }
 }
 
