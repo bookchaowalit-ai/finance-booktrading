@@ -141,6 +141,8 @@ export default function LandingPageClient({ lang }: { lang: string }) {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [contactSent, setContactSent] = useState(false);
   const [liveStats, setLiveStats] = useState<LiveStats | null>(null);
+  // Until the first fetch settles, the stats are loading, not unavailable.
+  const [statsLoaded, setStatsLoaded] = useState(false);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -159,6 +161,9 @@ export default function LandingPageClient({ lang }: { lang: string }) {
         })
         .catch(() => {
           if (!cancelled) setLiveStats(null);
+        })
+        .finally(() => {
+          if (!cancelled) setStatsLoaded(true);
         });
     load();
     const interval = setInterval(load, 60000);
@@ -350,14 +355,16 @@ export default function LandingPageClient({ lang }: { lang: string }) {
             ) : (
               <div className="inline-flex items-center gap-2 bg-slate-700/40 text-gray-300 text-sm font-medium px-4 py-1.5 rounded-full border border-slate-600 mb-4">
                 <span className="w-2 h-2 bg-gray-400 rounded-full" />
-                {lang === 'th' ? 'ข้อมูลสดยังไม่พร้อม' : 'Live data unavailable'}
+                {!statsLoaded
+                  ? (lang === 'th' ? 'กำลังโหลดข้อมูลสด…' : 'Loading live data…')
+                  : (lang === 'th' ? 'ข้อมูลสดยังไม่พร้อม' : 'Live data unavailable')}
               </div>
             )}
             <h2 className="text-3xl font-bold mb-2">
               {lang === 'th' ? 'ประสิทธิภาพเรียลไทม์' : 'Real-Time Performance'}
             </h2>
             <p className="text-gray-400">
-              {liveStats
+              {liveStats || !statsLoaded
                 ? (lang === 'th' ? 'ข้อมูลสดจากบอทเทรดแบบ paper' : 'Live data from the paper-trading bots')
                 : (lang === 'th' ? 'ดึงข้อมูลบอทไม่ได้ตอนนี้ ตัวเลขด้านล่างจึงยังไม่ทราบ' : 'Bot data cannot be fetched right now, so the figures below are unknown')}
             </p>

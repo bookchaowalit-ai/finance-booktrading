@@ -13,12 +13,19 @@ export interface LiveStats {
 
 type Json = Record<string, unknown>;
 
-const num = (...values: unknown[]): number => {
+/** First finite number among the candidates; null when the source did not send one. */
+const pick = (...values: unknown[]): number | null => {
   for (const v of values) if (typeof v === 'number' && Number.isFinite(v)) return v;
-  return 0;
+  return null;
 };
 
-/** Null when no source answered; otherwise stats with unknown fields left null. */
+const asObject = (v: unknown): Json | null => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : null);
+
+/**
+ * Null when no source gave a usable figure; otherwise stats with unknown fields
+ * left null. A missing field is unknown, never 0, and the running-bot count
+ * needs a boolean running flag from all three bots.
+ */
 export async function fetchLiveStats(fetchImpl: typeof fetch = fetch): Promise<LiveStats | null> {
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
   const STRATEGY_API = process.env.NEXT_PUBLIC_STRATEGY_URL || '/strategy-api';
@@ -26,10 +33,10 @@ export async function fetchLiveStats(fetchImpl: typeof fetch = fetch): Promise<L
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  const getJson = async (url: string): Promise<Json> => {
+  const getJson = async (url: string): Promise<unknown> => {
     const res = await fetchImpl(url, { headers });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as Json;
+    return res.json();
   };
 
   const [paperRes, polyRes, arbRes] = await Promise.allSettled([
@@ -37,17 +44,18 @@ export async function fetchLiveStats(fetchImpl: typeof fetch = fetch): Promise<L
     getJson(`${STRATEGY_API}/api/poly-paper/performance`),
     getJson(`${STRATEGY_API}/api/arb-paper/status`),
   ]);
-  const paper = paperRes.status === 'fulfilled' ? paperRes.value : null;
-  const poly = polyRes.status === 'fulfilled' ? polyRes.value : null;
-  const arb = arbRes.status === 'fulfilled' ? arbRes.value : null;
-  if (!paper && !poly && !arb) return null;
+  const paper = paperRes.status === 'fulfilled' ? asObject(paperRes.value) : null;
+  const poly = polyRes.status === 'fulfilled' ? asObject(polyRes.value) : null;
+  const arb = arbRes.status === 'fulfilled' ? asObject(arbRes.value) : null;
 
-  return {
-    paperPnl: paper ? num(paper.total_pnl, paper.net_pnl) : null,
-    paperTrades: paper ? num(paper.total_trades, paper.trade_count) : null,
-    polyPnl: poly ? num(poly.total_pnl) : null,
-    polyTrades: poly ? num(poly.total_trades) : null,
-    arbScans: arb ? num(arb.scan_count) : null,
-    botsRunning: paper && arb ? (arb.running ? 1 : 0) + (paper.running ? 1 : 0) : null,
+  const flags = [paper?.running, poly?.running, arb?.running];
+  const stats: LiveStats = {
+    paperPnl: pick(paper?.total_pnl, paper?.net_pnl),
+    paperTrades: pick(paper?.total_trades, paper?.trade_count),
+    polyPnl: pick(poly?.total_pnl),
+    polyTrades: pick(poly?.total_trades),
+    arbScans: pick(arb?.scan_count),
+    botsRunning: flags.every((f) => typeof f === 'boolean') ? flags.filter(Boolean).length : null,
   };
+  return Object.values(stats).some((v) => v !== null) ? stats : null;
 }

@@ -21,6 +21,52 @@ export interface AuthResult {
   error?: string;
 }
 
+export const UNEXPECTED_ANSWER_ERROR = 'The server sent an answer this page could not read. Please try again later.';
+export const STORAGE_ERROR = 'The server answered, but this browser could not save the session. Please try again.';
+
+/** The JSON object in an error answer, or null when the body is not one. */
+async function readErrorBody(response: Response): Promise<{ error?: string; code?: string } | null> {
+  const data: unknown = await response.json().catch(() => null);
+  return data && typeof data === 'object' ? (data as { error?: string; code?: string }) : null;
+}
+
+/**
+ * Read a successful auth answer and save the session. Each step fails with its
+ * own message: an unreadable or malformed body is the server's answer, a
+ * storage failure is the browser's.
+ */
+async function saveSession(response: Response): Promise<AuthResult> {
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch {
+    return { success: false, error: UNEXPECTED_ANSWER_ERROR };
+  }
+  const body = data && typeof data === 'object' ? (data as { token?: unknown; user?: unknown }) : null;
+  if (!body || typeof body.token !== 'string' || !body.token || !body.user || typeof body.user !== 'object') {
+    return { success: false, error: UNEXPECTED_ANSWER_ERROR };
+  }
+  const user = body.user as User;
+  try {
+    localStorage.setItem('auth_token', body.token);
+    localStorage.setItem('user', JSON.stringify(user));
+  } catch {
+    return { success: false, error: STORAGE_ERROR };
+  }
+  return { success: true, user, token: body.token };
+}
+
+/** Message for a request that never got an answer. */
+function requestFailure(err: unknown): AuthResult {
+  if (err instanceof Error && err.name === 'AbortError') {
+    return { success: false, error: 'Request timed out. Please try again.' };
+  }
+  if (isNetworkError(err)) {
+    return { success: false, error: backendOfflineMessage(currentLocale()) };
+  }
+  return { success: false, error: UNEXPECTED_ANSWER_ERROR };
+}
+
 /**
  * Authenticate user via backend API
  */
@@ -43,26 +89,14 @@ export async function authenticate(email: string, password: string): Promise<Aut
 
     if (!response.ok) {
       const fallback = response.status >= 500 ? 'Login failed. Please try again.' : 'Invalid email or password';
-      const data = await response.json().catch(() => ({ error: fallback }));
-      return { success: false, error: data.error || fallback };
+      const data = await readErrorBody(response);
+      return { success: false, error: data?.error || fallback };
     }
 
-    const data: { token: string; user: User } = await response.json();
-
-    localStorage.setItem('auth_token', data.token);
-    localStorage.setItem('user', JSON.stringify(data.user));
-
-    return { success: true, user: data.user, token: data.token };
+    return await saveSession(response);
   } catch (err) {
     clearTimeout(timeout);
-    if (err instanceof Error && err.name === 'AbortError') {
-      return { success: false, error: 'Request timed out. Please try again.' };
-    }
-    if (isNetworkError(err)) {
-      return { success: false, error: backendOfflineMessage(currentLocale()) };
-    }
-    // The backend answered; the browser failed afterwards (e.g. storage full).
-    return { success: false, error: 'The server answered, but this browser could not save the session. Please try again.' };
+    return requestFailure(err);
   }
 }
 
@@ -136,32 +170,20 @@ export async function register(
     }
 
     if (!response.ok) {
-      const data = await response.json().catch(() => ({ error: 'Registration failed' }));
+      const data = await readErrorBody(response);
       if (response.status === 403) {
         return {
           success: false,
-          error: REGISTRATION_ERRORS_TH[data?.code] ?? REGISTRATION_ERRORS_TH.registration_closed,
+          error: REGISTRATION_ERRORS_TH[data?.code ?? ''] ?? REGISTRATION_ERRORS_TH.registration_closed,
         };
       }
-      return { success: false, error: data.error || 'Registration failed' };
+      return { success: false, error: data?.error || 'Registration failed' };
     }
 
-    const data: { token: string; user: User } = await response.json();
-
-    localStorage.setItem('auth_token', data.token);
-    localStorage.setItem('user', JSON.stringify(data.user));
-
-    return { success: true, user: data.user, token: data.token };
+    return await saveSession(response);
   } catch (err) {
     clearTimeout(timeout);
-    if (err instanceof Error && err.name === 'AbortError') {
-      return { success: false, error: 'Request timed out. Please try again.' };
-    }
-    if (isNetworkError(err)) {
-      return { success: false, error: backendOfflineMessage(currentLocale()) };
-    }
-    // The backend answered; the browser failed afterwards (e.g. storage full).
-    return { success: false, error: 'The server answered, but this browser could not save the session. Please try again.' };
+    return requestFailure(err);
   }
 }
 
