@@ -21,7 +21,7 @@ describe('BackendOfflineBanner', () => {
     render(<BackendOfflineBanner lang="th" />);
     expect(await screen.findByRole('status')).toBeInTheDocument();
     await vi.advanceTimersByTimeAsync(30000);
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(() => expect(screen.getByRole('status')).toBeEmptyDOMElement());
     vi.useRealTimers();
   });
 
@@ -30,6 +30,7 @@ describe('BackendOfflineBanner', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<BackendOfflineBanner lang="en" />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    expect(screen.queryByRole('status')).toBeNull();
+    // The empty live region is present from the start so a later warning is announced.
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
   });
 });

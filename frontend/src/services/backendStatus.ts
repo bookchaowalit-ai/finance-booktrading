@@ -29,6 +29,27 @@ export function isBackendUnreachableStatus(status: number): boolean {
   return status === 502 || status === 503 || status === 504;
 }
 
+/**
+ * The offline message for a failed auth response, or null when the failure
+ * is the request's own. 502/503/504 are gateway answers. A 500 is ambiguous:
+ * the Next.js rewrite answers 500 when it cannot reach the upstream, and a
+ * handler answers 500 when it fails, so ask the health route which it is.
+ */
+export async function offlineErrorForStatus(
+  status: number,
+  locale: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  if (isBackendUnreachableStatus(status)) return backendOfflineMessage(locale);
+  if (status === 500 && (await checkBackend(fetchImpl)) === 'offline') return backendOfflineMessage(locale);
+  return null;
+}
+
+/** fetch() rejects with a TypeError when the network request itself fails. */
+export function isNetworkError(err: unknown): boolean {
+  return err instanceof TypeError;
+}
+
 /** One quick probe of the public health route: no retries, short timeout. */
 export async function checkBackend(fetchImpl: typeof fetch = fetch): Promise<Exclude<BackendState, 'checking'>> {
   const controller = new AbortController();

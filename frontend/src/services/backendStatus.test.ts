@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { checkBackend, backendOfflineMessage, isBackendDownStatus, isBackendUnreachableStatus } from './backendStatus';
+import { checkBackend, backendOfflineMessage, isBackendDownStatus, isBackendUnreachableStatus, offlineErrorForStatus, isNetworkError } from './backendStatus';
 
 const res = (status: number) => ({ status, ok: status >= 200 && status < 300 }) as Response;
 
@@ -46,5 +46,30 @@ describe('backendOfflineMessage', () => {
     expect(backendOfflineMessage('en')).toContain('cannot be reached');
     expect(backendOfflineMessage('en')).not.toMatch(/no real money/i);
     expect(backendOfflineMessage('xx')).toBe(backendOfflineMessage('en'));
+  });
+});
+
+describe('offlineErrorForStatus', () => {
+  it('reports offline for a gateway answer without probing', async () => {
+    const fetchImpl = vi.fn();
+    await expect(offlineErrorForStatus(502, 'th', fetchImpl)).resolves.toBe(backendOfflineMessage('th'));
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it('reports offline for a proxy 500 when the health route is also down', async () => {
+    await expect(offlineErrorForStatus(500, 'en', vi.fn().mockResolvedValue(res(500)))).resolves.toBe(backendOfflineMessage('en'));
+  });
+  it('leaves a handler 500 to the form when the health route answers', async () => {
+    await expect(offlineErrorForStatus(500, 'en', vi.fn().mockResolvedValue(res(200)))).resolves.toBeNull();
+  });
+  it('leaves client errors alone', async () => {
+    await expect(offlineErrorForStatus(401, 'en', vi.fn())).resolves.toBeNull();
+  });
+});
+
+describe('isNetworkError', () => {
+  it('counts only fetch network failures', () => {
+    expect(isNetworkError(new TypeError('fetch failed'))).toBe(true);
+    expect(isNetworkError(new DOMException('quota', 'QuotaExceededError'))).toBe(false);
+    expect(isNetworkError(new SyntaxError('bad json'))).toBe(false);
   });
 });

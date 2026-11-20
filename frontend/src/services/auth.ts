@@ -3,7 +3,7 @@
  * Connects to backend /api/auth endpoints
  */
 
-import { backendOfflineMessage, currentLocale, isBackendUnreachableStatus } from './backendStatus';
+import { backendOfflineMessage, currentLocale, isNetworkError, offlineErrorForStatus } from './backendStatus';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -36,13 +36,15 @@ export async function authenticate(email: string, password: string): Promise<Aut
     });
     clearTimeout(timeout);
 
-    if (isBackendUnreachableStatus(response.status)) {
-      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    const offline = await offlineErrorForStatus(response.status, currentLocale());
+    if (offline) {
+      return { success: false, error: offline };
     }
 
     if (!response.ok) {
-      const data = await response.json().catch(() => ({ error: 'Invalid email or password' }));
-      return { success: false, error: data.error || 'Invalid email or password' };
+      const fallback = response.status >= 500 ? 'Login failed. Please try again.' : 'Invalid email or password';
+      const data = await response.json().catch(() => ({ error: fallback }));
+      return { success: false, error: data.error || fallback };
     }
 
     const data: { token: string; user: User } = await response.json();
@@ -56,7 +58,11 @@ export async function authenticate(email: string, password: string): Promise<Aut
     if (err instanceof Error && err.name === 'AbortError') {
       return { success: false, error: 'Request timed out. Please try again.' };
     }
-    return { success: false, error: backendOfflineMessage(currentLocale()) };
+    if (isNetworkError(err)) {
+      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    }
+    // The backend answered; the browser failed afterwards (e.g. storage full).
+    return { success: false, error: 'The server answered, but this browser could not save the session. Please try again.' };
   }
 }
 
@@ -124,8 +130,9 @@ export async function register(
     });
     clearTimeout(timeout);
 
-    if (isBackendUnreachableStatus(response.status)) {
-      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    const offline = await offlineErrorForStatus(response.status, currentLocale());
+    if (offline) {
+      return { success: false, error: offline };
     }
 
     if (!response.ok) {
@@ -150,7 +157,11 @@ export async function register(
     if (err instanceof Error && err.name === 'AbortError') {
       return { success: false, error: 'Request timed out. Please try again.' };
     }
-    return { success: false, error: backendOfflineMessage(currentLocale()) };
+    if (isNetworkError(err)) {
+      return { success: false, error: backendOfflineMessage(currentLocale()) };
+    }
+    // The backend answered; the browser failed afterwards (e.g. storage full).
+    return { success: false, error: 'The server answered, but this browser could not save the session. Please try again.' };
   }
 }
 
