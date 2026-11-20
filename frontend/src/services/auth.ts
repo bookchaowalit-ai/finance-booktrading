@@ -3,7 +3,7 @@
  * Connects to backend /api/auth endpoints
  */
 
-import { backendOfflineMessage, currentLocale, isBackendDownStatus } from './backendStatus';
+import { backendOfflineMessage, currentLocale, isBackendUnreachableStatus } from './backendStatus';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -36,7 +36,7 @@ export async function authenticate(email: string, password: string): Promise<Aut
     });
     clearTimeout(timeout);
 
-    if (isBackendDownStatus(response.status)) {
+    if (isBackendUnreachableStatus(response.status)) {
       return { success: false, error: backendOfflineMessage(currentLocale()) };
     }
 
@@ -124,7 +124,7 @@ export async function register(
     });
     clearTimeout(timeout);
 
-    if (isBackendDownStatus(response.status)) {
+    if (isBackendUnreachableStatus(response.status)) {
       return { success: false, error: backendOfflineMessage(currentLocale()) };
     }
 

@@ -9,7 +9,20 @@ describe('BackendOfflineBanner', () => {
   it('tells the visitor in Thai that the backend is offline when /api/health answers 502', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 502, ok: false }));
     render(<BackendOfflineBanner lang="th" />);
-    expect(await screen.findByRole('status')).toHaveTextContent('ระบบหลังบ้านปิดอยู่');
+    expect(await screen.findByRole('status')).toHaveTextContent('เชื่อมต่อระบบหลังบ้านไม่ได้');
+  });
+
+  it('hides the banner once a later probe finds the backend back', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ status: 502, ok: false })
+      .mockResolvedValue({ status: 200, ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<BackendOfflineBanner lang="th" />);
+    expect(await screen.findByRole('status')).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(30000);
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    vi.useRealTimers();
   });
 
   it('renders nothing when the backend is healthy', async () => {

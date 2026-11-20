@@ -9,12 +9,24 @@
 
 export type BackendState = 'checking' | 'online' | 'offline';
 
-const HEALTH_PATH = '/api/health';
+// Same base URL as auth.ts and api.ts: a direct backend when
+// NEXT_PUBLIC_API_URL is set, otherwise the same-origin /api rewrite.
+const HEALTH_URL = `${process.env.NEXT_PUBLIC_API_URL || ''}/api/health`;
 const CHECK_TIMEOUT_MS = 5000;
+export const RECHECK_INTERVAL_MS = 30000;
 
-/** A 5xx from the proxy or the backend means the backend cannot serve. */
+/** Any 5xx from the health route means the backend cannot serve. */
 export function isBackendDownStatus(status: number): boolean {
   return status >= 500;
+}
+
+/**
+ * Gateway answers (502/503/504) mean the request never reached a working
+ * backend. A plain 500 from a handler such as login is that request failing,
+ * not the backend being offline.
+ */
+export function isBackendUnreachableStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
 }
 
 /** One quick probe of the public health route: no retries, short timeout. */
@@ -22,7 +34,7 @@ export async function checkBackend(fetchImpl: typeof fetch = fetch): Promise<Exc
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
   try {
-    const res = await fetchImpl(HEALTH_PATH, { cache: 'no-store', signal: controller.signal });
+    const res = await fetchImpl(HEALTH_URL, { cache: 'no-store', signal: controller.signal });
     return isBackendDownStatus(res.status) ? 'offline' : 'online';
   } catch {
     return 'offline';
@@ -33,12 +45,12 @@ export async function checkBackend(fetchImpl: typeof fetch = fetch): Promise<Exc
 
 const MESSAGES: Record<string, { title: string; body: string }> = {
   th: {
-    title: 'ระบบหลังบ้านปิดอยู่ตอนนี้',
-    body: 'เข้าสู่ระบบและดูข้อมูลสดไม่ได้ชั่วคราว บอทเทรดหยุดอยู่ตามโหมดปกป้องเงินทุน และไม่มีเงินจริงถูกใช้',
+    title: 'เชื่อมต่อระบบหลังบ้านไม่ได้ตอนนี้',
+    body: 'เข้าสู่ระบบและดูข้อมูลสดไม่ได้ชั่วคราว หน้านี้จึงยืนยันสถานะบอทและคำสั่งเทรดที่เปิดอยู่ไม่ได้',
   },
   en: {
-    title: 'The backend is offline right now',
-    body: 'Sign-in and live data are unavailable for now. The trading bot is halted in capital-protection mode and no real money is in use.',
+    title: 'The backend cannot be reached right now',
+    body: 'Sign-in and live data are unavailable for now, so this page cannot confirm the bot state or any open orders.',
   },
 };
 

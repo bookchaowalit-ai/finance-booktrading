@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { BackendState, backendOfflineText, checkBackend } from '@/services/backendStatus';
+import { BackendState, RECHECK_INTERVAL_MS, backendOfflineText, checkBackend } from '@/services/backendStatus';
 
 interface Props {
   lang: string;
@@ -18,11 +18,16 @@ export default function BackendOfflineBanner({ lang, className = '' }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    checkBackend().then((s) => {
-      if (!cancelled) setState(s);
-    });
+    const probe = () =>
+      checkBackend().then((s) => {
+        if (!cancelled) setState(s);
+      });
+    probe();
+    // Keep following the backend: hide the banner once it recovers, show it if it drops.
+    const timer = setInterval(probe, RECHECK_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, []);
 
