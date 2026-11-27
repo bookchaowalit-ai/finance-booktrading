@@ -2,8 +2,9 @@
 
 ระบบนี้คือ BookFinance (repo `finance-booktrading`) — trading command center ของเจ้าของคนเดียว (single operator)
 ที่ default เป็น observe-only และให้ bot ทำงานภายใต้ risk manager / kill switch
-ภาพรวม business swimlane ฉบับกลางอยู่ที่ central flow pack (ดู "Reused" ด้านล่าง) — ไฟล์นี้วาดใหม่จาก code ปัจจุบัน (`origin/main` 425b989, 2026-11-03)
-เพราะบางจุดใน pack (pinned 8de42ee, 2026-08-19) ไม่ตรงกับ code แล้ว
+ภาพรวม business swimlane ฉบับกลางอยู่ที่ central flow pack (ดู "Reused" ด้านล่าง) — ไฟล์นี้วาดใหม่จาก code เพราะบางจุดใน pack (pinned 8de42ee, 2026-08-19) ไม่ตรงกับ code แล้ว
+
+Last reviewed: 2026-11-27 · commit `6d53c39`
 
 ## As-Is (จาก code วันนี้)
 
@@ -80,7 +81,19 @@ To-Be ที่เขียนไว้แล้วใน repo:
 
 - Central flow pack layer 1: `bookchaowalit/architecture-docs` → `docs/architecture/flows/booktrading-ui/01-business-swimlane.md` (read-only, pinned 8de42ee). ใช้เป็นภาพอ้างอิง; ส่วนที่ต่างจาก code วันนี้: pack วาด kill switch gate ไว้หน้า Go order execution แต่ใน code ปัจจุบัน gate อยู่ใน `RealGridBot` ฝั่ง Python ก่อนเรียก `/api/trade/order` — Go `OrderService.CreateOrder` (`backend/internal/domain/service/implementation.go`) ไม่เรียก risk check ใดๆ.
 
+## Gap
+
+| ID | As-Is → To-Be | Status | Owner | Evidence |
+|---|---|---|---|---|
+| G1 | Gate 0 signal baseline ยัง collecting → ผ่าน 100+ signals | doing | owner | `docs/READINESS_CHECKLIST.md` (Current Status: Gate 0 Collecting) |
+| G2 | Gate 1 dry-run ยังไม่ผ่าน → enable `POLY_DRY_RUN` หลังมีหลักฐาน | blocked | owner | `docs/READINESS_CHECKLIST.md` (Gate 1 blocked by paper drawdown และ positions) |
+| G3 | Gate 2 → Gate 4 (reset kill switch, micro-live, production deploy) ยังไม่เริ่ม | blocked | owner | `docs/READINESS_CHECKLIST.md` (Gate 2–4 not ready) |
+| G4 | เงินคำนวณด้วย float → Decimal / integer minor units ที่ขอบ exchange | todo | claude | `docs/UPGRADE-PLAN.md` (P1 Money math) |
+| G5 | admin ได้จาก bootstrap account เท่านั้น → admin-only role management endpoint | todo | claude | `docs/UPGRADE-PLAN.md` (P1) |
+| G6 | login lockout อยู่ใน memory → Redis | todo | claude | `docs/UPGRADE-PLAN.md` (P1) |
+| G7 | KPI-O-01 ยังไม่เคยวัด → paper P&L รายเดือนฉบับแรก (กำหนด 2026-11-30) | todo | owner | `docs/measurement/KPI-PLAN.md` |
+| G8 | To-Be ของ product นอก trading gates (multi-user / RBAC ใน README Roadmap) ไม่มี spec | decide | owner | `README.md` Roadmap; ไม่มี spec |
+
 ## Open questions
 
-- To-Be ของ product (นอกเหนือ trading gates) เช่น multi-user / RBAC ใน README Roadmap ยังเป็น checkbox ไม่มี spec — เจ้าของต้องยืนยันว่ายังอยู่ใน scope หรือไม่.
-- Host ที่รัน docker compose จริงอยู่ที่ไหนตอนนี้ (EVIDENCE_LOG 2026-07-23 บอกว่า live Binance TH mainnet trading เคยรัน) — ไม่มีใน repo.
+- Host ที่รัน docker compose จริงอยู่ที่ไหนตอนนี้ (EVIDENCE_LOG 2026-07-23 บอกว่า live Binance TH mainnet trading เคยรัน) — ไม่มีใน repo [ต้องยืนยัน].
